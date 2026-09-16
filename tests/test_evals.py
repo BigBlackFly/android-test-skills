@@ -164,6 +164,141 @@ def run():
         errors, hints = self._lint(src)
         self.assertFalse(any("tap_no_guard" in h[1] for h in hints))
 
+    # ── 规则 5/6/7：像素写死（坐标脆弱性的静态门禁）────────────────
+    def test_pixel_const_reported_175_form(self):
+        """规则 6：`DLG_TOP, DLG_BOTTOM = 1350, 1870` —— 实测 175.py:64 的形态。
+
+        这是 M1 验收项（"lint_case.py 能报出 175.py:64"）的**可重复版本**：
+        现场那条已加 `# noqa` 留痕（避免 CI 红），所以验收靠本测试保证，
+        而不是靠一个会阻断 CI 的活体违规。
+        """
+        src = '''
+USER_INPUT = "test"
+DLG_TOP, DLG_BOTTOM = 1350, 1870
+def run():
+    t = TestCase("test")
+    return t.finish()
+'''
+        errors, _ = self._lint(src)
+        self.assertEqual(len([e for e in errors if e[1] == "pixel_const"]), 2)
+
+    def test_pixel_const_noqa_exempt(self):
+        """规则 6 的 noqa 出口：留痕豁免必须生效（否则只能整体关掉规则）。"""
+        src = '''
+USER_INPUT = "test"
+# noqa: pixel_const
+DLG_TOP, DLG_BOTTOM = 1350, 1870
+def run():
+    t = TestCase("test")
+    return t.finish()
+'''
+        errors, _ = self._lint(src)
+        self.assertFalse(any(e[1] == "pixel_const" for e in errors))
+
+    def test_pixel_const_ignores_non_pixel_names(self):
+        """规则 6 只认空间语义名：`TIMEOUT = 30` 这类合法常量绝不能误报
+        （规则一旦误报就会被整体关掉，比漏报更糟）。"""
+        src = '''
+USER_INPUT = "test"
+TIMEOUT = 30
+MAX_PICK_ATTEMPTS = 3
+RID_LESSON = "com.x:id/tv_lesson"
+def run():
+    t = TestCase("test")
+    return t.finish()
+'''
+        errors, _ = self._lint(src)
+        self.assertFalse(any(e[1] == "pixel_const" for e in errors))
+
+    def test_pixel_const_only_module_level(self):
+        """规则 6 只看模块级：函数里算出来的像素中间量不算违规。"""
+        src = '''
+USER_INPUT = "test"
+def run():
+    t = TestCase("test")
+    Y_TOP = int(h * 0.8)
+    return t.finish()
+'''
+        errors, _ = self._lint(src)
+        self.assertFalse(any(e[1] == "pixel_const" for e in errors))
+
+    def test_pixel_literal_in_ocr(self):
+        """规则 5：`t.ocr(1350, 1870)` 的写死像素区间。"""
+        src = '''
+USER_INPUT = "test"
+def run():
+    t = TestCase("test")
+    t.ocr(1350, 1870)
+'''
+        errors, _ = self._lint(src)
+        self.assertTrue(any(e[1] == "pixel_literal" for e in errors))
+
+    def test_pixel_literal_noqa(self):
+        """规则 5 的 noqa 出口。"""
+        src = '''
+USER_INPUT = "test"
+def run():
+    t = TestCase("test")
+    t.ocr(1350, 1870)  # noqa
+'''
+        errors, _ = self._lint(src)
+        self.assertFalse(any(e[1] == "pixel_literal" for e in errors))
+
+    def test_ocr_with_variables_not_flagged(self):
+        """规则 5 只报字面量：`t.ocr(y0, y1)`（变量）由规则 6 管定义处。"""
+        src = '''
+USER_INPUT = "test"
+def run():
+    t = TestCase("test")
+    y0, y1 = 1, 2
+    t.ocr(y0, y1)
+'''
+        errors, _ = self._lint(src)
+        self.assertFalse(any(e[1] == "pixel_literal" for e in errors))
+
+    def test_pixel_literal_ignores_non_pixel_params(self):
+        """规则 5 的**关键边界**：`tap_vision(desc, repeat=1, timeout=30)`
+        里的 1/30 不是像素，绝不能报 —— 逐 API 列像素参数就是为了避免这种
+        误报（全参数扫描会把正常代码全报成违规）。"""
+        src = '''
+USER_INPUT = "test"
+def run():
+    t = TestCase("test")
+    t.tap_vision("保存按钮", repeat=1, timeout=30)
+'''
+        errors, _ = self._lint(src)
+        self.assertFalse(any(e[1] == "pixel_literal" for e in errors))
+
+    def test_pixel_fixed_offset_is_hint_only(self):
+        """规则 7：`tap_xy(b[0] + 61, b[1] + 31)` —— 实测 179.py:281 形态。
+
+        提示级（不阻断 CI）：它是"从 bounds 派生 + 固定偏移"，介于合规与
+        违规之间，值得看见但不该拦构建。
+        """
+        src = '''
+USER_INPUT = "test"
+def run():
+    t = TestCase("test")
+    b = t.el_bounds(rid="save")
+    if b:
+        t.tap_xy(b[0] + 61, b[1] + 31, observe=False)
+'''
+        errors, hints = self._lint(src)
+        self.assertFalse(any(e[1] == "pixel_offset" for e in errors))
+        self.assertTrue(any(h[1] == "pixel_offset" for h in hints))
+
+    def test_ratio_expression_not_offset(self):
+        """规则 7 不看比例式：`w // 2` / `int(h * 0.8)` 是动态推导，不提示。"""
+        src = '''
+USER_INPUT = "test"
+def run():
+    t = TestCase("test")
+    w, h = 100, 200
+    t.tap_xy(w // 2, int(h * 0.8))
+'''
+        errors, hints = self._lint(src)
+        self.assertFalse(any(h_[1] == "pixel_offset" for h_ in hints))
+
     def test_syntax_error(self):
         """语法错误的文件 → syntax_error 报错。"""
         src = 'USER_INPUT = "test"\ndef (: pass\n'

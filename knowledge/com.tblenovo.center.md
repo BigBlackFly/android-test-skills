@@ -1,6 +1,6 @@
 # 服务与反馈（Lenovo）
 
-<!-- App 卡（MD 格式）。机器只 grep/阅读，不 parse 结构。 -->
+<!-- App 卡（MD 格式）。机器靠关键词检索 + 只读命中片段，不 parse 结构。 -->
 
 - **app**: `com.tblenovo.center`
 - **name**: 服务与反馈

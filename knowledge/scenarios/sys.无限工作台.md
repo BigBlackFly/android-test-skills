@@ -8,7 +8,7 @@
 判定命令: adb shell settings get system zui_ov_desktop_mode
 判定说明: 1 = 开启，0 = 关闭
 
-<!-- AI 检索用：grep -rl "<触发词>" knowledge/scenarios/ -->
+<!-- AI 检索用：按触发词检索 knowledge/scenarios/（Windows Select-String / *nix grep -rl） -->
 触发词:
 - 无限工作台
 - 工作台

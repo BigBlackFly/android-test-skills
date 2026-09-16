@@ -141,8 +141,13 @@ def _grep_storage(word, storage_dirs):
 
 def check_facts_file(path, storage_dirs):
     """检查单个用例文件的 toast 断言词是否有出处。
-    返回 (suspects, checked)  —— suspects: [(line, word)], checked: int。"""
-    with open(path, encoding="utf-8") as f:
+    返回 (suspects, checked)  —— suspects: [(line, word)], checked: int。
+
+    ⚠️ `utf-8-sig` 而非 `utf-8`：带 BOM 的用例 .py 用 utf-8 读会解出首字符
+    U+FEFF → `ast.parse` 抛 SyntaxError → 被下面的 except 吞成 `([], 0)`，
+    **静默跳过该文件的事实检查**（这是四处 BOM 敏感读取里最隐蔽的一处）。
+    """
+    with open(path, encoding="utf-8-sig") as f:
         source = f.read()
     try:
         tree = ast.parse(source, filename=path)

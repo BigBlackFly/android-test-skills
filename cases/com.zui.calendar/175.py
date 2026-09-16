@@ -60,7 +60,11 @@ EXPECT = [
 
 REMIND_OPTS = ["不提醒", "任务发生时", "5分钟前", "15分钟前", "30分钟前"]
 
-# 弹框内容区（customPanel）的屏幕坐标，用于 OCR 补读当前值
+# 弹框内容区（customPanel）的屏幕坐标，用于 OCR 补读当前值。
+# 这是**已知待清除**的设备绑定值：按 smart-skill-roadmap v5.0 的 A2.3，应改为
+#   从弹框容器 bounds 现场推导内容区（横竖屏/换设备都成立）。在改完之前用
+#   noqa 显式留痕，而不是把 lint 规则整体关掉。
+# noqa: pixel_const
 DLG_TOP, DLG_BOTTOM = 1350, 1870
 
 

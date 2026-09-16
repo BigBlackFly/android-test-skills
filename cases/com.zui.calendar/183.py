@@ -254,7 +254,7 @@ def run():
     if not t.tap_rid(BTN_FINISH, silent=True):
         t.blocked("确认页未找到「完成」按钮，无法保存课程表")
         return t.finish()
-    time.sleep(4)
+    time.sleep(4)   # 等「保存完成 → 跳列表页」落定（超过 3s settle 线，须写明原因）
     # 保存后到的是「全部课程表」列表页（TimetableListActivity），不是周视图
     # （183 首跑踩到：按周视图断言 cards，等满 12s 仍为 0）。
     # 列表页点课名 = 编辑课程表（EditTimetableActivity），也不是查看。

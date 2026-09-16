@@ -380,6 +380,9 @@ def extract_user_input_from_source(source: str) -> str | None:
 
     只认模块顶层的 `USER_INPUT = <字符串字面量>`；找不到或源码无法解析返回 None。
     """
+    # 兜底剥离 BOM：调用方可能直接传字符串（不经 extract_user_input 的文件
+    # 读取路径）。与那里的 utf-8-sig 属同一件事的两道防线（有 BOM 就剥掉）。
+    source = source.lstrip("\ufeff")
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
@@ -396,9 +399,23 @@ def extract_user_input_from_source(source: str) -> str | None:
 
 
 def extract_user_input(path: str) -> str | None:
-    """从用例脚本文件提取 USER_INPUT 常量（AI 生成用例时写入用户原始描述）。"""
+    """从用例脚本文件提取 USER_INPUT 常量（AI 生成用例时写入用户原始描述）。
+
+    ⚠️ **必须用 utf-8-sig 读**（不是 utf-8）：用例 .py 由外部工具产出，可能带
+    UTF-8 BOM。带 BOM 时 `utf-8` 解出的首字符是 U+FEFF，`ast.parse()` 抛
+    SyntaxError → 被下面的 except 吞掉 → **静默返回 None**。
+
+    后果是三重静默（2026-09-14 实测确认）：
+      1. `cases.user_input` 写空；
+      2. `_should_record()` 判 False → **该用例不入库**；
+      3. `_guard_exec_cache()` 用同一个判据 → **执行期缓存守卫静默失效**
+         （拿过期数据当结论不再被拦 = 假 PASS 风险）。
+    而 `importlib` 加载同一文件是正常的（Python 自己按 utf-8-sig 处理），
+    所以用例照跑、PASS、退出码 0 —— 全程没有任何提示。
+    `utf-8-sig` 读**无 BOM** 文件与 `utf-8` 行为完全一致，零回归风险。
+    """
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             source = f.read()
     except OSError:
         return None

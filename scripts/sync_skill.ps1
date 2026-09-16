@@ -45,13 +45,19 @@ Get-ChildItem (Join-Path $from 'framework') -File -ErrorAction SilentlyContinue 
 Get-ChildItem (Join-Path $from 'tests') -File -Filter '*.py' -ErrorAction SilentlyContinue | ForEach-Object {
     $files += Join-Path 'tests' $_.Name
 }
-# scripts/ 下的脚本与文档
 foreach ($n in @('SKILL.md')) {
     if (Test-Path -LiteralPath (Join-Path $from $n)) { $files += $n }
 }
-foreach ($n in @('run_case.ps1','setup.ps1','setup.sh','webui.ps1','webui.sh','export.sh','sync_skill.ps1')) {
-    $rel = Join-Path 'scripts' $n
-    if (Test-Path -LiteralPath (Join-Path $from $rel)) { $files += $rel }
+# scripts/ **全量**。原来是 7 个文件的白名单 —— 实测漏掉 check_bom.ps1 /
+# check_context_budget.py / cleanup_records.py，后果是：工作区跑不了 SKILL.md
+# 硬要求的 check_bom，也跑不了依赖它们的单测（`tests/` 会 ModuleNotFoundError）。
+Get-ChildItem (Join-Path $from 'scripts') -File -ErrorAction SilentlyContinue | ForEach-Object {
+    $files += Join-Path 'scripts' $_.Name
+}
+# evals/ **全量**（静态 lint + 事实守门；`tests/test_evals.py` 依赖它们）。
+# 不同步 → 工作区的 tests/ 同样跑不出完整单测。
+Get-ChildItem (Join-Path $from 'evals') -File -Filter '*.py' -ErrorAction SilentlyContinue | ForEach-Object {
+    $files += Join-Path 'evals' $_.Name
 }
 
 $copied = 0; $skipped = 0; $failed = 0

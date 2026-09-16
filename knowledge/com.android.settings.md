@@ -1,10 +1,9 @@
 # 系统设置（ZUI Settings）
 
-<!-- App 卡（MD 格式）。机器只 grep/阅读，不 parse 结构。 -->
+<!-- App 卡（MD 格式）。机器靠关键词检索 + 只读命中片段，不 parse 结构。 -->
 
 - **app**: `com.android.settings`
 - **name**: 系统设置 / ZUI Settings
-- **验证版本**: ZUXOS 2.5.02.160 开发版（TB323FU / Android 17 / 8 寸平板 1904×3040）
 - **最近验证**: 2026-09-09（双栏布局、deep link、导航条目属性 实测）
 
 ## 检索索引

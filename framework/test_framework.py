@@ -182,6 +182,15 @@ class CaseAbort(Exception):
     run_case.py 捕获后仍会生成报告，退出码按 FAIL（1）处理。"""
 
 
+class ExecutionTimeCacheError(CaseAbort):
+    """执行期误用缓存 API —— 必须 raise 阻断，否则拿过期数据当结论 = 假 PASS。
+
+    **必须继承 CaseAbort（不是 RuntimeError）**：CaseAbort 走 FAIL(1) 路径、
+    报告正常出；RuntimeError 会被 run_case 当 `_fatal_error` → 结论压成 ERROR、
+    退出码 3，报告还会写"执行异常终止，结论不可信"。
+    """
+
+
 class _Located:
     """locate() 的返回值：组合属性定位结果的轻量包装。
 
@@ -346,6 +355,12 @@ def _should_record(user_input, name):
     return False
 
 
+def _rot_name(rot):
+    """mRotation 的官方语义 → 中文（0/2 = 竖，1/3 = 横）。"""
+    return {0: "竖屏", 2: "竖屏(反向)", 1: "横屏", 3: "横屏(反向)"}.get(
+        rot, f"未知({rot})")
+
+
 class TestCase:
     def __init__(self, name, device_id=None, case_dir=None, user_input=None, script_path=None,
                  vision=None, env_ignore=()):
@@ -445,11 +460,10 @@ class TestCase:
                     self.name, self.device_info,
                     user_input=self.user_input, script_path=self.script_path,
                     suite_id=int(_suite_id) if _suite_id else None)
-                # 「只留最新」：同一用例（同 name）的历史执行记录连同子表一并清掉，
-                # 避免 cases 越积越多 + 子表孤儿数据（steps/results/evidences/actions）。
-                # 用 script_path 精确到"同一个用例文件"，不误伤同名不同包。
-                self._db.drop_previous_cases(self.name, self.script_path,
-                                             keep_id=self._db_case_id)
+                # ⚠️ 「只留最新」的 drop_previous_cases **刻意不在这里**（2026-09-15 改）：
+                #    在此处删 = 用例一"开始"就把上次的好记录**连同报告与截图**销毁，
+                #    本次若被杀（套件超时 / Ctrl-C / 断连 / 用例崩）→ 两边都不剩。
+                #    已挪到 finish() 的 finish_case 成功之后，见那里的说明。
             except Exception as e:
                 # 入库失败不再静默：记录丢失意味着 Web UI/追溯链断裂
                 print(f"⚠️ [db] 用例入库失败（测试继续，但本次执行无记录）: {e}")
@@ -477,6 +491,12 @@ class TestCase:
                 self._env_baseline = self.states.env_snapshot()
         except Exception:
             pass   # 取基线失败不阻断用例
+        # 方向基线（**真实旋转**，不是 settings 值）：__init__ 取一次，
+        # lock_portrait() 后刷新（否则锁屏动作本身会被判成"方向变了"），
+        # finish() 再取一次 → 两者不同 = 用例中途坐标系换过 → 记 WARN。
+        # 与 _env_baseline 的关键差别：该检测**不受 env_ignore 约束**
+        # （env_ignore 的语义是"用例自己合法改环境"，不能掩盖外部改写）。
+        self._rotation_baseline = self.device_rotation()
         # ── 清场钩子（cleanups）──────────────────────────────────────
         # 用例用 add_cleanup() 登记"必须还原"的动作，finish() 时逆序执行。
         # 存在的理由：用例中途 return t.finish() 或抛异常时，写在函数末尾的
@@ -1441,6 +1461,37 @@ class TestCase:
         """写系统设置"""
         return self.adb_shell("settings", "put", scope, key, value)
 
+    # ── 方向探测（读**真实旋转**，不是 settings 值）────────────────────
+    # 为什么必须读 mRotation：
+    #   `user_rotation` 只在 `accelerometer_rotation=0` 时被系统采纳；自动旋转
+    #   开着时它是**被忽略的残值**——这正是"实测 user_rotation=0 却是横屏"
+    #   那次误判的来源（当时 accel=1，测到的是设备物理姿态，不是设置值映射）。
+    #   而用例关心的永远是"屏幕现在实际是竖是横"（决定坐标系），故读实际值。
+    # 为什么不用 u2 的 d.info：实测 Android 17 上它直接抛 RPCUnknownError
+    #   （ApplicationSharedMemory not initialized @ UiDevice.getDisplaySizeDp），
+    #   与 smoke.py:64 的注释一致 —— 不能依赖。
+    # 成本：`dumpsys window displays` 实测约 0.21s（单次）。
+    _ROT_RE = re.compile(r"mRotation=(\d+)\s+mDeferredRotationPauseCount")
+    _ROT_RE_FALLBACK = re.compile(r"^\s+mRotation=(\d+)\s*$", re.M)
+
+    def device_rotation(self):
+        """当前真实屏幕旋转（0/1/2/3）；任何失败返回 None（收尾绝不能因此中断）。
+
+        0/2 = 竖，1/3 = 横。读不到（adb 异常 / 未连接 / 单测桩对象）→ None，
+        调用方按"未知"处理（不比较、不误报）。
+        """
+        try:
+            out = self.adb_shell("dumpsys", "window", "displays")
+        except Exception:
+            return None
+        if not out:
+            return None
+        m = self._ROT_RE.search(out) or self._ROT_RE_FALLBACK.search(out)
+        try:
+            return int(m.group(1)) if m else None
+        except (AttributeError, ValueError):
+            return None
+
     # ── 旋屏约定（套件基线 = 竖屏锁定，见 docs/case-writing.md）─────────────
     # 血泪教训：119 曾在 finally 写死 accelerometer_rotation=1"还原现场"，
     # 结果设备立马转成横屏，下一个脚本坐标系全错、长按点到状态栏拉下
@@ -1448,10 +1499,23 @@ class TestCase:
     # 结尾不恢复（基线即竖屏锁定，"不动"就是正确的现场）；只有真正中途
     # 转屏的用例才用 snapshot_rotation/restore_rotation 成对出现。
     def lock_portrait(self):
-        """锁定竖屏（套件基线）。用例开头调用；结尾无需恢复。"""
+        """锁定竖屏（套件基线）。用例开头调用；结尾无需恢复。
+
+        ⚠️ **本方法只保证"调用后立刻是竖屏"，不保证"用例全程是竖屏"**：
+        实测 App 冷启动（`pm_clear` + `launch_app`）会把
+        `accelerometer_rotation` 改回 1（0→1），锁定态被解开，设备随后可能
+        随物理姿态翻回横屏。178 实测正是如此：`lock_portrait()` 后
+        cur=1904x3040 / mRotation=0（竖屏 ✅），前置冷启动后 accel 变回 1，
+        全用例实际以横屏跑完并 PASS —— 因为它的坐标**全部现场派生**。
+
+        所以：本方法不是"方向保证"，只是"把起始姿态摆正"。
+        **全程方向保证在 finish() 的方向变化检测**（见 `_rotation_baseline`），
+        它不受 env_ignore 约束。
+        """
         self.adb_shell("settings", "put", "system", "accelerometer_rotation", "0")
         self.adb_shell("settings", "put", "system", "user_rotation", "0")
         time.sleep(0.5)
+        self._rotation_baseline = self.device_rotation()   # 刷新方向基线（见 __init__）
         # 刷新漂移基线：lock_portrait 会改旋转设置，不刷新则这两个键
         # 每次都报漂移。刷新后 finish() 只检测用例主体逻辑是否污染了环境。
         try:
@@ -1904,7 +1968,11 @@ class TestCase:
     def ocr(self, y_min=0, y_max=99999, x_min=0, x_max=99999, image_bytes=None):
         """截屏 + rapidocr，返回 [(x, y, conf, text)]（原图像素坐标）。
         image_bytes：传入已定格的 PNG 字节时直接 OCR 它（capture_toast 用），
-        不传则现场截屏。"""
+        不传则现场截屏。
+
+        ⚠️ 调用方**不要写死像素范围**（换设备 / 换方向即失效）：范围应从元素 bounds
+        或当次窗口尺寸派生。传了非默认范围却一条都没读到时会记 WARN ——
+        「指定区域读空」是设备相关硬编码最典型的静默降级，必须可见。"""
         if self._ocr is None:
             from rapidocr_onnxruntime import RapidOCR
             self._ocr = RapidOCR()
@@ -1923,6 +1991,20 @@ class TestCase:
             cx, cy = int(sum(xs) / 4), int(sum(ys) / 4)
             if y_min <= cy <= y_max and x_min <= cx <= x_max:
                 out.append((cx, cy, float(conf), text))
+        # 指定区域读空 → 可见化。
+        # 旧行为：静默返回 []，调用方（如 175._ocr_numbers）把它当"OCR 没读到"记一条
+        # INFO，报告里无人可见 —— 换设备后硬编码范围失效就是这样消失的。
+        # image_bytes 非空 = 调用方在读一份**已定格的帧**（capture_toast），读空是
+        # 合法结果（toast 已消失），不告警，避免制造噪音。
+        if (not out and image_bytes is None
+                and (y_min > 0 or y_max < 99999 or x_min > 0 or x_max < 99999)):
+            try:
+                self.record("WARN",
+                            f"OCR 在指定区域读到 0 条"
+                            f"（x {x_min}~{x_max}, y {y_min}~{y_max}）—— "
+                            f"范围若是写死的像素值，换设备/换方向即失效")
+            except Exception:
+                pass
         return out
 
     def ocr_find(self, keyword, y_min=0, y_max=99999):
@@ -1950,11 +2032,35 @@ class TestCase:
                 pass
         return os.path.join(PROBE_DIR, pkg, label)
 
+    def _guard_exec_cache(self, api):
+        """执行期（正式用例）禁用探查缓存：拿过期数据当结论 = 假 PASS。
+
+        判据复用 `_should_record`（有 USER_INPUT = 用户口述的正式用例），
+        不引入新的状态位；探查/补采/备数据脚本无 USER_INPUT → 不拦。
+        `probe_page` 免检：它本就是"给正式用例里临时探一下的兜底"。
+
+        **必须先 record("FAIL") 再 raise**：只 raise 不 record 的话，finish() 会按
+        "目前所有断言都 PASS" 算出 PASS，而 run_case 的退出码是 1 —— 报告与退出码打架
+        （run_case.py 注释里专门警告过的那种）。未命中拦截时静默返回。
+        """
+        if getattr(self, "_in_probe_page", False):
+            return
+        if not _should_record(getattr(self, "user_input", None), self.name):
+            return
+        self.record("FAIL",
+                    f"执行期误用缓存: {api}() 拿过期数据当结论（假 PASS 风险）")
+        raise ExecutionTimeCacheError(f"禁止在执行期间使用 {api}")
+
     def cached_dump(self, label, ttl=None, refresh=False, pkg=None):
         """取 UI 树，优先读缓存。
         ttl: 缓存有效期（秒），None=永不过期；refresh=True 强制重探。
         pkg: 归属包名（探查系统页时显式传被测包，避免缓存散到系统包名下）。
+
+        ⚠️ 仅供探查期 / 写代码参考。**执行期（正式用例）调用会被
+        _guard_exec_cache 拦下** —— 缓存里的数据属于上一次运行或另一台设备，
+        拿它当结论就是假 PASS。probe_page 内部调用免检。
         """
+        self._guard_exec_cache("cached_dump")
         d = self._probe_dir(label, pkg=pkg)
         fp = os.path.join(d, "dump.xml")
         if not refresh and os.path.isfile(fp):
@@ -1973,7 +2079,12 @@ class TestCase:
         return xml
 
     def cached_ocr(self, label, y_min=0, y_max=99999, refresh=False, pkg=None):
-        """取 OCR 结果，优先读缓存。返回 [(x, y, conf, text)]。"""
+        """取 OCR 结果，优先读缓存。返回 [(x, y, conf, text)]。
+
+        ⚠️ 仅供探查期 / 写代码参考；执行期调用被 _guard_exec_cache 拦下
+        （同 cached_dump）。probe_page 内部调用免检。
+        """
+        self._guard_exec_cache("cached_ocr")
         import json
         d = self._probe_dir(label, pkg=pkg)
         fp = os.path.join(d, "ocr.json")
@@ -2006,7 +2117,13 @@ class TestCase:
         """
         if getattr(self, "trace", None) is None or not self.trace.enabled:
             self.set_trace()          # 幂等：已开启则直接返回现有会话
-        xml = self.cached_dump(label, ttl=ttl, refresh=refresh, pkg=pkg)
+        # 免检窗口：probe_page 是"给正式用例里临时探一下的兜底"（本方法 docstring
+        # 明确允许在正式用例里调用），故其内部的 cached_* 不被 _guard_exec_cache 拦。
+        self._in_probe_page = True
+        try:
+            xml = self.cached_dump(label, ttl=ttl, refresh=refresh, pkg=pkg)
+        finally:
+            self._in_probe_page = False
         nodes = [{
             "rid": n["rid"], "text": n["text"], "desc": n["desc"],
             "cls": n["cls"], "bounds": n["bounds"], "bounds_xy": n["bounds_xy"],
@@ -2025,7 +2142,11 @@ class TestCase:
             "nodes": nodes,
         }
         if ocr:
-            info["ocr"] = self.cached_ocr(label, refresh=refresh, pkg=pkg)
+            self._in_probe_page = True
+            try:
+                info["ocr"] = self.cached_ocr(label, refresh=refresh, pkg=pkg)
+            finally:
+                self._in_probe_page = False
         # meta 落盘，便于检索
         import json
         d = self._probe_dir(label, pkg=pkg)
@@ -2252,6 +2373,38 @@ class TestCase:
                         self.final_status = "WARN"
             except Exception:
                 pass   # 漂移检测失败不阻断报告生成
+        # ── 方向变化检测：**刻意不吃 env_ignore** ──────────────────────
+        # 为什么单独一条、且不能被 env_ignore 抑制：
+        #   锁定态会被 App 冷启动解开（实测 pm_clear+launch_app 后
+        #   accelerometer_rotation 由 0 变 1），设备随后可能随物理姿态翻转
+        #   → 用例中途坐标系换了一次。此时断言**未必挂**（178 就靠"坐标全部
+        #   现场派生"在横屏下照样 PASS），所以它是"结论可信"问题而非失败：
+        #   结果对不代表过程稳。
+        #   env_ignore 的语义是"用例自己合法改了环境"（旋屏用例），不能用来
+        #   掩盖"环境被外部改写" —— 178 现在正是用 env_ignore 把这条静音的。
+        # 为什么比较"起始 vs 结束"而不是"中间是否变过"：
+        #   `snapshot_rotation`/`restore_rotation` 成对出现的合法转屏用例，
+        #   结束时方向已还原 → 起始==结束 → 不报。只有**把设备留在另一个
+        #   方向**的用例才报（= 119 事故与 178 的形态）。
+        self._rotation_start = None
+        self._rotation_end = None
+        try:
+            self._rotation_start = getattr(self, "_rotation_baseline", None)
+            self._rotation_end = self.device_rotation()
+            if (self._rotation_start is not None
+                    and self._rotation_end is not None
+                    and self._rotation_start != self._rotation_end):
+                self.record(
+                    "WARN",
+                    f"用例中途方向变化: rotation {self._rotation_start}"
+                    f"→{self._rotation_end}（"
+                    f"{_rot_name(self._rotation_start)}→"
+                    f"{_rot_name(self._rotation_end)}）"
+                    f" —— 锁定态被外部改写，坐标系中途换过（结论可信性风险）")
+                if self.final_status == "PASS":
+                    self.final_status = "WARN"
+        except Exception:
+            pass   # 方向探测失败不阻断报告生成
         LAST_CASE = self                 # run_case.py 取最终结论定退出码
         # 包名同时入库：报告文件可能丢，库里的记录不会丢，
         # 重建报告时才能原样还原「被测 App」这一栏。
@@ -2299,13 +2452,49 @@ class TestCase:
         print(f"📊 UI dump 次数: {self._dump_count}")
         # 完成用例记录入库
         if self._db is not None and self._db_case_id is not None:
+            finished_ok = False
             try:
                 self._db.finish_case(
                     self._db_case_id, path, summary,
                     final_status=self.final_status, package=package)
+                finished_ok = True
             except Exception as e:
                 # 入库失败不再静默：记录丢失意味着 Web UI/追溯链断裂
                 print(f"⚠️ [db] 用例完成状态入库失败: {e}")
+            # 度量落库（append-only，保留趋势）：cases 表被 drop_previous_cases 删旧行，
+            # 回答不了"这次改动有没有更快"；duration_sec 是唯一的性能口径。
+            try:
+                self._db.record_metrics(
+                    script_path=self.script_path, device=self.device_info,
+                    duration_sec=duration_sec,
+                    ocr=getattr(self, "_ocr_count", 0),
+                    derived=getattr(self, "_derived_clicks", 0),
+                    dump=getattr(self, "_dump_count", 0),
+                    rot_start=getattr(self, "_rotation_start", None),
+                    rot_end=getattr(self, "_rotation_end", None))
+            except Exception as e:
+                print(f"⚠️ [db] 度量入库失败: {e}")
+            # ── 记录清理放在**结尾**，不在 start_case / __init__（2026-09-15 改）──
+            #   在开头删 = 用例一"开始"就销毁上次的好记录 + 报告 + 截图；本次若被杀
+            #   （套件超时 / Ctrl-C / 断连 / 用例崩）→ 什么都没剩。
+            #   实测代价：一次被中断的套件把 168-177 共 8 个用例的记录清成空壳；
+            #   178 的 09-11 基线也这样丢过一次（备份早于实战，救不回来）。
+            #   在结尾删 = "用完整的新记录替换旧记录"；中断时旧记录留着（哪怕状态陈旧，
+            #   也远好过没有）。finished_ok 守卫：本次入库没成功就不删旧的。
+            #   ① 迭代清理：脚本被改过 → 被改动取代的旧记录是探索噪音
+            #      （本次是套件记录时不动探索记录，见方法内守卫）
+            #   ② 只留最新：同一用例（name + script_path）只留本次这一条
+            if finished_ok:
+                try:
+                    self._db.cleanup_iterated_cases(
+                        self.script_path, self.device_info, self._db_case_id)
+                except Exception as e:
+                    print(f"⚠️ [db] 迭代旧记录清理失败（不影响本次记录）: {e}")
+                try:
+                    self._db.drop_previous_cases(self.name, self.script_path,
+                                                 keep_id=self._db_case_id)
+                except Exception as e:
+                    print(f"⚠️ [db] 旧记录清理失败（不影响本次记录）: {e}")
         self._finished = True
         self._report_path = path
         # 探针/探查用例不入库，其截图目录与报告只是调试中间产物，

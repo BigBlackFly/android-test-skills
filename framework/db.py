@@ -161,6 +161,31 @@ CREATE TABLE IF NOT EXISTS suites (
   warn_n INT,
   report_path TEXT
 );
+-- 度量（append-only，刻意不被 drop_previous_cases 清理）：
+--   cases 表同一用例只留最新一条，回答不了"这次改动有没有更快"；
+--   本表按 script_path 累积，是趋势的唯一来源。
+--   duration_sec = 墙钟耗时，**唯一的性能口径**；
+--   ocr_calls / derived_clicks / dump_snaps 是合规性计数器
+--   （OCR 是否真跑 / 坐标是否从 bounds 派生 / dump 次数），
+--   **不要拿 dump_snaps 当性能指标**（178 实测 116 次只占 2.6% 耗时）。
+--   rotation_start / rotation_end = 用例起止的**真实屏幕旋转**（mRotation
+--   0-3；0/2 竖、1/3 横）。两者不同 = 用例中途方向变过（锁定态被 App 冷启动
+--   解开，实测 accelerometer_rotation 0→1），属「结论可信」维度的事件，
+--   **不是性能指标**。存在理由：178 在横屏下照样 PASS（坐标全部现场派生），
+--   但"过程稳不稳"必须可见 —— 本表回答"到底有几个用例中途方向变过"。
+CREATE TABLE IF NOT EXISTS case_metrics (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  script_path TEXT NOT NULL,
+  device TEXT,
+  started_at TEXT NOT NULL,
+  duration_sec REAL,
+  ocr_calls INTEGER,
+  derived_clicks INTEGER,
+  dump_snaps INTEGER,
+  rotation_start INTEGER,
+  rotation_end INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_case_metrics_started ON case_metrics(started_at);
 """
 
 # 旧库迁移：为早期建的表补列（幂等；列已存在时 ALTER 抛错，忽略即可）
@@ -176,6 +201,10 @@ _MIGRATIONS = [
     # suite_id：套件 runner 关联（run_suite.py 插入 suites 行后透传给子进程）。
     # 单跑时该列为 NULL，不影响现有逻辑。
     "ALTER TABLE cases ADD COLUMN suite_id INTEGER",
+    # case_metrics 方向列：回答"16 个用例里到底有几个跑的过程中方向变过"。
+    # 老库没有这两列 → NULL，health_check 按"未知"处理（不误计为变化）。
+    "ALTER TABLE case_metrics ADD COLUMN rotation_start INTEGER",
+    "ALTER TABLE case_metrics ADD COLUMN rotation_end INTEGER",
 ]
 
 
@@ -259,10 +288,10 @@ class RecordDB:
                  user_input, script_path, suite_id))
             new_id = cur.lastrowid
             self._local.conn.commit()
-        # 迭代清理：脚本被改过 + 同设备 + 非套件 → 旧记录是探索噪音，清掉。
-        # 放在锁外：级联删 + 磁盘产物清理可能耗时，不阻塞其它并发操作。
-        if script_path and suite_id is None:
-            self._cleanup_iterated_cases(script_path, device, new_id)
+        # ⚠️ 「脚本被改过 → 旧记录是探索噪音」的迭代清理**刻意不在这里**
+        #    （2026-09-15 改）：在 start_case 里清 = 用例一开始就把上次记录**连同
+        #    报告与截图**删掉，本次若被杀（套件超时 / Ctrl-C / 断连 / 用例崩）→
+        #    两边都不剩。已挪到 cleanup_iterated_cases()，由 finish_case 之后调用。
         return new_id
 
     def finish_case(self, case_id, report_path, summary, final_status=None,
@@ -417,6 +446,71 @@ class RecordDB:
                 })
             return result
 
+    # ── 度量（append-only）───────────────────────────────────────────
+    def record_metrics(self, script_path, device, duration_sec,
+                       ocr=0, derived=0, dump=0, rot_start=None, rot_end=None):
+        """写入一条用例度量；失败不抛（度量不该阻断用例收尾）。
+
+        - script_path: 用例脚本路径（趋势按它聚合；直跑脚本时可能为 None → 跳过）
+        - duration_sec: 墙钟耗时秒数（**唯一性能口径**）
+        - ocr/derived/dump: 合规性计数器，含义见 _SCHEMA 注释
+        - rot_start/rot_end: 用例起止的**真实屏幕旋转**（mRotation 0-3）。
+          两者不同 = 用例中途方向变过 —— 是「结论可信」事件，**不是性能指标**。
+          探测失败/老库补列时为 None，**不要拿 None 当 0**（None 与 0 混同会把
+          "未知"误报成"竖屏→横屏"）。
+        - started_at 在**这里**取 now 的 ISO 字符串，不接受 time.time() 的 float：
+          否则 ORDER BY started_at 会退化成 float 排序，与 cases.started_at 混排。
+        """
+        if not script_path:
+            return None
+        with self._lock:
+            self._connect().execute(
+                "INSERT INTO case_metrics (script_path, device, started_at,"
+                " duration_sec, ocr_calls, derived_clicks, dump_snaps,"
+                " rotation_start, rotation_end)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (script_path, device,
+                 datetime.now().isoformat(timespec="seconds"),
+                 duration_sec, ocr, derived, dump, rot_start, rot_end))
+            self._local.conn.commit()
+        return True
+
+    def health_check(self, limit=100):
+        """用例健康度聚合（与 flaky_stats / card_freshness 同层）。
+
+        从 append-only 的 case_metrics 读趋势（**不是** cases 表——它只留最新一条）。
+        返回 {duration_p50, duration_p90, ocr_p90, dump_p90, samples,
+              rotation_changed}。
+
+        `rotation_changed` = 最近 limit 条里"起止方向不同"的条数 —— 直接回答
+        "有几个用例跑的过程中方向变过"（= 锁定态被 App 冷启动解开的暴露面）。
+        起止任一为 None（老库补列 / 探测失败）→ **不计入**，避免把"未知"当"变了"。
+        """
+        with self._lock:
+            rows = self._connect().execute(
+                "SELECT duration_sec, ocr_calls, dump_snaps,"
+                " rotation_start, rotation_end FROM case_metrics"
+                " ORDER BY started_at DESC LIMIT ?", (limit,)).fetchall()
+        if not rows:
+            return {"duration_p50": 0, "duration_p90": 0,
+                    "ocr_p90": 0, "dump_p90": 0, "samples": 0,
+                    "rotation_changed": 0}
+
+        def _pct(vals, q):
+            vals = sorted(v or 0 for v in vals)
+            return vals[min(len(vals) - 1, int(round((len(vals) - 1) * q)))]
+
+        return {
+            "duration_p50": _pct([r[0] for r in rows], 0.5),
+            "duration_p90": _pct([r[0] for r in rows], 0.9),
+            "ocr_p90": _pct([r[1] for r in rows], 0.9),
+            "dump_p90": _pct([r[2] for r in rows], 0.9),
+            "rotation_changed": sum(1 for r in rows
+                                    if r[3] is not None and r[4] is not None
+                                    and r[3] != r[4]),
+            "samples": len(rows),
+        }
+
     # ── suites ──────────────────────────────────────────────────────
     def start_suite(self, filter_desc, total):
         """插入套件记录，返回 suite_id。子进程通过 DSH_SUITE_ID 环境变量关联。"""
@@ -509,7 +603,7 @@ class RecordDB:
                     "package", "duration_seconds", "status"]
             return [dict(zip(cols, row)) for row in cur.fetchall()]
 
-    def _cleanup_iterated_cases(self, script_path, device, exclude_id):
+    def cleanup_iterated_cases(self, script_path, device, exclude_id):
         """清理同脚本的迭代旧记录（脚本被改过 → 旧记录是探索噪音）。
 
         判定规则：
@@ -519,16 +613,31 @@ class RecordDB:
         条件叠加（B+C）：
           - 同 script_path + 同 device（换设备保留）
           - suite_id IS NULL（套件记录保留）
+          - 本次（exclude_id）也必须是非套件记录才清（套件跑动时不动探索记录）
+
+        ⚠️ 调用时机（2026-09-15 改，与 drop_previous_cases 同一原则）：
+          只能在**本次记录完整落库之后**调用（`finish_case` 之后），不能在
+          `start_case` 里。以前在 start_case 里清 = 用例一开始就把上次记录连同
+          报告与截图删掉；本次若被杀（套件超时 / Ctrl-C / 断连 / 用例崩）→
+          两边都不剩 —— 实测 168-177 共 8 个用例就是这样被清成空壳的。
+
+        返回删除的记录数（脚本不存在等情况下为 0）；失败不抛
+        （记录清理不该阻断用例执行）。
         """
         # 脚本文件不存在（可能被删了）或 mtime 取不到 → 不清理
         try:
             mtime = os.path.getmtime(script_path)
         except OSError:
-            return
+            return 0
         mtime_iso = datetime.fromtimestamp(mtime).isoformat(timespec="seconds")
 
         with self._lock:
             cur = self._connect().cursor()
+            cur.execute("SELECT suite_id FROM cases WHERE id=?", (exclude_id,))
+            row = cur.fetchone()
+            # 本次记录不存在，或本身是套件记录 → 不动探索记录
+            if row is None or row[0] is not None:
+                return 0
             cur.execute(
                 "SELECT id, started_at FROM cases"
                 " WHERE script_path=? AND device=? AND suite_id IS NULL AND id!=?"
@@ -541,11 +650,14 @@ class RecordDB:
                     old_ids.append(oid)
 
         # 逐条复用 delete_case 的级联删除 + 产物清理逻辑
+        removed = 0
         for oid in old_ids:
             try:
                 self.delete_case(oid, remove_artifacts=True)
+                removed += 1
             except Exception:
                 pass  # 清理失败不阻塞主流程
+        return removed
 
     def delete_case(self, case_id, remove_artifacts=False):
         """删除用例记录，级联删除 steps/results/evidences/actions。
@@ -672,9 +784,32 @@ class RecordDB:
             except OSError:
                 pass
             for p in candidates:
-                if is_artifact_path(p) and safe_remove(p):
+                if not is_artifact_path(p):   # 只删运行产物目录内的文件
+                    continue
+                # ⚠️ 仍被别的记录引用 → 不删。报告名 `<name>_报告.md` 是**共享**的
+                #    （finish() 的既定语义：重跑覆盖），而上面的 stem 前缀匹配会
+                #    命中**本次刚写的**那份报告 —— 清理一旦挪到 finish() 之后，
+                #    旧记录的产物清理就把当前报告一起删了。
+                #    2026-09-15 实测：183 记录在、报告消失（含时间戳备份，0 个残留）。
+                if self._report_referenced_elsewhere(p, case_id):
+                    continue
+                if safe_remove(p):
                     removed += 1
         return removed
+
+    def _report_referenced_elsewhere(self, report_path, exclude_case):
+        """报告是否仍被别的记录引用（同名用例重跑共用同一份报告名）。
+
+        在 delete_case 的锁外调用，内部短暂重新加锁 —— 与
+        _dir_referenced_elsewhere（截图目录共享时不能整目录删）同一套路数。
+        **库行已删掉之后**才调用：此时"本次保留的那条"仍在库里，会被正确
+        识别为"还被引用"，从而保住本次报告。
+        """
+        with self._lock:
+            row = self._connect().execute(
+                "SELECT COUNT(*) FROM cases WHERE report_path=? AND id!=?",
+                (report_path, exclude_case)).fetchone()
+        return bool(row and row[0])
 
     def _dir_referenced_elsewhere(self, shot_dir, exclude_case):
         """检查截图目录是否被除 exclude_case 外的其它记录引用。
@@ -756,9 +891,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="测试记录数据库 CLI")
     parser.add_argument("--stale-cards", type=int, metavar="DAYS",
                         help="列出超过 N 天未验证的知识卡")
+    parser.add_argument("--health", action="store_true",
+                        help="打印用例度量聚合（耗时 P50/P90 + 合规计数）")
     args = parser.parse_args()
 
     db = get_db()
+    if args.health:
+        h = db.health_check()
+        if not h["samples"]:
+            print("📊 暂无度量数据（case_metrics 为空）")
+        else:
+            print(f"📊 样本 {h['samples']} 条 / "
+                  f"耗时 P50={h['duration_p50']}s P90={h['duration_p90']}s / "
+                  f"OCR P90={h['ocr_p90']} / dump P90={h['dump_p90']}")
+        raise SystemExit(0)
     if args.stale_cards is not None:
         from datetime import datetime as _dt, timedelta
         cutoff = (_dt.now() - timedelta(days=args.stale_cards)).isoformat(

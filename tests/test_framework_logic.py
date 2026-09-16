@@ -202,6 +202,34 @@ class TestExtractUserInput(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_from_file_with_utf8_bom(self):
+        """带 UTF-8 BOM 的用例文件必须照样提取出 USER_INPUT。
+
+        回归 2026-09-14 实测的**三重静默**事故：`utf-8` 读带 BOM 文件 → 首字符
+        是 U+FEFF → `ast.parse` 抛 SyntaxError → 被 except 吞成 None → ①
+        `user_input` 写空；② `_should_record()` 判 False → 用例不入库；③
+        `_guard_exec_cache()` 用同一判据 → 执行期缓存守卫静默失效。
+        而 `importlib` 加载同一文件是正常的（Python 按 utf-8-sig 处理），
+        所以现象是"用例照跑、PASS、退出码 0，但没记录、没守卫、无任何提示"。
+        """
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False,
+                                         encoding="utf-8-sig") as f:
+            f.write('USER_INPUT = """带 BOM 的描述"""\n')
+            path = f.name
+        try:
+            with open(path, "rb") as rb:
+                # 前置自检：确认文件真的有 BOM（否则本测试会"因错误的原因通过"）
+                self.assertEqual(rb.read(3), b"\xef\xbb\xbf")
+            self.assertEqual(run_case.extract_user_input(path), "带 BOM 的描述")
+        finally:
+            os.unlink(path)
+
+    def test_extract_from_source_with_bom_prefix(self):
+        """直接传字符串（不经文件读取）时也要能剥掉 BOM。"""
+        src = '\ufeffUSER_INPUT = "带 BOM 字符串"'
+        self.assertEqual(run_case.extract_user_input_from_source(src),
+                         "带 BOM 字符串")
+
 
 class TestFrameworkDrift(unittest.TestCase):
     def _mk(self, root, files):
@@ -381,6 +409,13 @@ class TestFinalStatus(unittest.TestCase):
         t.steps = [{"name": "s", "results":
                     [{"result": r, "detail": "x"} for r in results],
                     "evidences": []}]
+        # 清场钩子（finish() → _run_cleanups）与漂移检测要求的字段：桩用
+        # object.__new__ 绕过 __init__，这些属性不会自动存在
+        #（清场钩子上线时漏补，曾导致 9 个测试红）。
+        t._cleanups = []
+        t._cleanups_ran = False
+        t._env_baseline = None
+        t._env_ignore = set()
         return t
 
     def test_priority(self):
@@ -904,6 +939,12 @@ class TestEnvDriftInFinish(unittest.TestCase):
 
         s.adb = FakeAdb()
         t.states = s
+        t._cleanups = []
+        t._cleanups_ran = False
+        # _cur_step 必须指到一个 step：finish() 的漂移检测会 record("WARN", ...)，
+        # 缺这个属性会让 record() 抛 AttributeError，被漂移块的 `except: pass`
+        # 静默吞掉 → 漂移检测退化成永远不降级（本测试曾因此恒 PASS）。
+        t._cur_step = t.steps[0]
         return t
 
     def test_no_drift_stays_pass(self):
@@ -938,6 +979,48 @@ class TestEnvDriftInFinish(unittest.TestCase):
                                for r in warn_records))
         finally:
             tf.LAST_CASE = old_last
+
+    # ── 方向变化检测（不受 env_ignore 约束）──────────────────────────
+    def _mk_rot(self, rot_start, rot_end, env_ignore=()):
+        """_mk 的桩 + 可注入的方向读数（环境本身无漂移，隔离被测行为）。"""
+        baseline = {"accelerometer_rotation": "1", "user_rotation": "0",
+                    "stay_on_while_plugged_in": "3", "zen_mode": "0"}
+        t = self._mk(baseline, dict(baseline), env_ignore=env_ignore)
+        t._rotation_baseline = rot_start
+        t.device_rotation = lambda: rot_end
+        return t
+
+    def _finish(self, t):
+        old_last = tf.LAST_CASE
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    mock.patch.object(tf, "REPORT_DIR", tempfile.mkdtemp()):
+                t.finish()
+        finally:
+            tf.LAST_CASE = old_last
+        return " ".join(r["detail"] for s in t.steps for r in s["results"])
+
+    def test_rotation_change_warns_even_with_env_ignore(self):
+        """方向变化**不被 env_ignore 抑制** —— 178 正是这么把它静音掉的。
+
+        env_ignore 的语义是"用例自己合法改了环境"，不能掩盖"环境被外部
+        改写"（App 冷启动把 accelerometer_rotation 改回 1）。"""
+        t = self._mk_rot(0, 1, env_ignore=("accelerometer_rotation",))
+        details = self._finish(t)
+        self.assertEqual(t.final_status, "WARN")
+        self.assertIn("方向变化", details)
+
+    def test_rotation_restored_stays_pass(self):
+        """转屏后**还原**的用例不该报（snapshot/restore 成对）—— 起始==结束。"""
+        t = self._mk_rot(1, 1)
+        self._finish(t)
+        self.assertEqual(t.final_status, "PASS")
+
+    def test_rotation_unknown_does_not_warn(self):
+        """探测不到（None）不报 —— 不能把"未知"当"变了"。"""
+        t = self._mk_rot(None, 1)
+        self._finish(t)
+        self.assertEqual(t.final_status, "PASS")
 
     def test_env_ignore_prevents_drift_warn(self):
         baseline = {"accelerometer_rotation": "0", "user_rotation": "0",
@@ -1211,6 +1294,8 @@ class TestFinishSafeName(unittest.TestCase):
         t.case_dir = tempfile.mkdtemp()
         t.script_path = ""
         t.states = None
+        t._cleanups = []
+        t._cleanups_ran = False
         return t
 
     def test_colon_in_name(self):
@@ -1408,7 +1493,13 @@ class TestListCasesBasic(unittest.TestCase):
 
 # ── db.py: 迭代清理（mtime 信号）──────────────────────────────
 class TestIterativeCleanup(unittest.TestCase):
-    """start_case() 基于脚本 mtime 自动清理迭代旧记录。"""
+    """cleanup_iterated_cases() 基于脚本 mtime 清理迭代旧记录（判定规则）。
+
+    ⚠️ 调用时机（2026-09-15 改）：由 `finish_case` **之后**调用，不再在 `start_case`
+    里 —— 在 start_case 里清 = 用例一开始就删掉上次记录 + 报告 + 截图，本次被杀就
+    两边都不剩。本类只覆盖判定规则；"必须在 finish 之后"由
+    TestRecordCleanupTiming 用行为 + 源码级守卫兜住。
+    """
 
     def setUp(self):
         self._td = tempfile.TemporaryDirectory()
@@ -1423,22 +1514,32 @@ class TestIterativeCleanup(unittest.TestCase):
         self.rec.close()
         self._td.cleanup()
 
-    def _run(self, status="PASS", device="dev1"):
-        cid = self.rec.start_case("test", device=device, script_path=self.script)
+    def _run(self, status="PASS", device="dev1", suite_id=None, script=None):
+        """跑一次完整生命周期：start → finish → 迭代清理（模拟 finish() 的顺序）。"""
+        sp = script or self.script
+        cid = self.rec.start_case("test", device=device, script_path=sp,
+                                  suite_id=suite_id)
         self.rec.finish_case(cid, f"/tmp/test_{cid}_报告.md",
                              "1 通过 / 0 失败", final_status=status)
+        self.rec.cleanup_iterated_cases(sp, device, cid)
         return cid
 
     def test_iterate_deletes_old(self):
-        """脚本被改过 → 旧记录是迭代 → 删除。"""
-        self._run("FAIL")          # 第 1 次
+        """脚本被改过 → 旧记录是迭代 → 清掉（但必须发生在本轮跑完之后）。"""
+        cid1 = self._run("FAIL")   # 第 1 次
         # 模拟 Agent 改脚本
         time.sleep(1.1)  # 确保 mtime 差异（精度 1s）
         with open(self.script, "w") as f:
             f.write("# v2\n")
-        self._run("PASS")          # 第 2 次
+        # 第 2 次"建档"时不许清：此刻被打断也要保住 cid1
+        cid2 = self.rec.start_case("test", device="dev1", script_path=self.script)
+        self.assertIn(cid1, [r["id"] for r in self.rec.list_cases()],
+                      "start_case 不许清旧记录（时机已挪到 finish 之后）")
+        self.rec.finish_case(cid2, f"/tmp/test_{cid2}_报告.md",
+                             "1 通过 / 0 失败", final_status="PASS")
+        self.rec.cleanup_iterated_cases(self.script, "dev1", cid2)
         all_recs = self.rec.list_cases()
-        self.assertEqual(len(all_recs), 1, "迭代后应只留 1 条")
+        self.assertEqual(len(all_recs), 1, "跑完后应只留 1 条")
         self.assertEqual(all_recs[0]["status"], "PASS")
 
     def test_no_change_keeps_old(self):
@@ -1476,10 +1577,8 @@ class TestIterativeCleanup(unittest.TestCase):
     def test_script_missing_no_cleanup(self):
         """脚本不存在 → 不清理（安全降级）。"""
         fake = os.path.join(self._td.name, "nonexistent.py")
-        cid1 = self.rec.start_case("test", device="dev1", script_path=fake)
-        self.rec.finish_case(cid1, "/tmp/r.md", "1/0", final_status="FAIL")
-        cid2 = self.rec.start_case("test", device="dev1", script_path=fake)
-        self.rec.finish_case(cid2, "/tmp/r.md", "1/0", final_status="PASS")
+        self._run("FAIL", script=fake)
+        self._run("PASS", script=fake)
         all_recs = self.rec.list_cases()
         self.assertEqual(len(all_recs), 2, "脚本不存在时不应清理")
 
@@ -1494,6 +1593,427 @@ class TestIterativeCleanup(unittest.TestCase):
         all_recs = self.rec.list_cases()
         self.assertEqual(len(all_recs), 1)
         self.assertEqual(all_recs[0]["status"], "PASS")
+
+
+# ── P1-9：执行期缓存守卫（cached_* 在正式用例中必须 record FAIL + raise）──
+@unittest.skipIf(tf is None, "需要 uiautomator2（用工作区 venv 跑本测试）")
+class TestExecTimeCacheGuard(unittest.TestCase):
+    """执行期误用探查缓存 = 拿过期数据当结论 = 假 PASS，必须 raise 阻断。
+
+    回归保护：cached_ocr / cached_dump 曾完全无守卫。当前 cases/ 里调用数为 0，
+    但"框架没有这条边界"本身就是缺口（plan/gaps-and-roadmap.md 缺口 3）——
+    防的是下一个把 cached_* 写进正式用例的人。
+    """
+
+    def _mk(self, *, user_input="用这个skills执行测试用例 联想日历_178",
+            name="联想日历_178", in_probe=False):
+        t = object.__new__(tf.TestCase)
+        t.name = name
+        t.user_input = user_input
+        t._in_probe_page = in_probe
+        t.record = mock.Mock()
+        return t
+
+    def test_error_is_case_abort(self):
+        """必须继承 CaseAbort：走 FAIL(1) 路径，而不是 RuntimeError → ERROR(3)。"""
+        self.assertTrue(issubclass(tf.ExecutionTimeCacheError, tf.CaseAbort))
+
+    def test_cached_ocr_in_formal_case_raises(self):
+        t = self._mk()
+        with self.assertRaises(tf.ExecutionTimeCacheError):
+            t._guard_exec_cache("cached_ocr")
+        # 必须**先 record("FAIL") 再 raise**：只 raise 不 record 的话 finish() 会按
+        # "目前所有断言都 PASS" 算出 PASS，而退出码是 1 —— 报告与退出码打架。
+        t.record.assert_called_once()
+        self.assertEqual(t.record.call_args[0][0], "FAIL")
+        self.assertIn("cached_ocr", t.record.call_args[0][1])
+
+    def test_cached_dump_in_formal_case_raises(self):
+        t = self._mk()
+        with self.assertRaises(tf.ExecutionTimeCacheError):
+            t._guard_exec_cache("cached_dump")
+        self.assertEqual(t.record.call_args[0][0], "FAIL")
+
+    def test_probe_page_exempt(self):
+        """probe_page 免检：它是"给正式用例里临时探一下的兜底"，本就允许执行期调用。"""
+        t = self._mk(in_probe=True)
+        self.assertIsNone(t._guard_exec_cache("cached_dump"))
+        t.record.assert_not_called()
+
+    def test_aux_script_not_guarded(self):
+        """辅助脚本（无 USER_INPUT）不拦 —— 探查/补采/备数据全靠 cached_*。"""
+        t = self._mk(user_input=None)
+        self.assertIsNone(t._guard_exec_cache("cached_ocr"))
+        t.record.assert_not_called()
+
+    def test_blank_user_input_not_guarded(self):
+        t = self._mk(user_input="   ")
+        self.assertIsNone(t._guard_exec_cache("cached_ocr"))
+        t.record.assert_not_called()
+
+    def test_cached_dump_delegates_to_guard(self):
+        """cached_dump 进入即被拦（不必真走到读缓存文件那一步）。"""
+        t = self._mk()
+        with self.assertRaises(tf.ExecutionTimeCacheError):
+            t.cached_dump("某页面")
+
+    def test_cached_ocr_delegates_to_guard(self):
+        t = self._mk()
+        with self.assertRaises(tf.ExecutionTimeCacheError):
+            t.cached_ocr("某页面")
+
+
+# ── P1-5：ocr() 指定区域读空 → WARN（把「静默降级」变可见）────────────
+@unittest.skipIf(tf is None, "需要 uiautomator2（用工作区 venv 跑本测试）")
+class TestOcrEmptyRegionWarns(unittest.TestCase):
+    """设备相关硬编码最典型的后果：OCR 在写死的区域里读空 → 旧实现静默返回 []。
+
+    活样本 175.py:92 的 t.ocr(DLG_TOP, DLG_BOTTOM)：其 docstring 自述"只作 INFO
+    参考"，于是换设备后读空也无人可见。本测试锁住"读空必须可见"这条契约。
+    """
+
+    def _mk(self, texts=()):
+        from PIL import Image
+        t = object.__new__(tf.TestCase)
+        # 1600×1600 → ocr() 内部缩放系数 s = 1600/max(w,h) = 1.0，
+        # 假 OCR 返回的坐标即最终坐标，测试里可直接按像素写。
+        if texts:
+            box = [[0, 150], [10, 150], [10, 160], [0, 160]]   # 中心 y≈155
+            t._ocr = lambda arr: ([(box, texts[0], 0.99)], None)
+        else:
+            t._ocr = lambda arr: ([], None)
+        buf = io.BytesIO()
+        Image.new("RGB", (1600, 1600), "white").save(buf, format="PNG")
+        t._png = buf.getvalue()
+        t._screencap_bytes = lambda: t._png
+        t.record = mock.Mock()
+        return t
+
+    def test_full_screen_no_warn(self):
+        """t.ocr() 全屏读空 → 不告警（只有"写死范围"才值得告警）。"""
+        t = self._mk()
+        self.assertEqual(t.ocr(), [])
+        t.record.assert_not_called()
+
+    def test_empty_custom_region_warns(self):
+        t = self._mk()
+        self.assertEqual(t.ocr(100, 200), [])
+        t.record.assert_called_once()
+        self.assertEqual(t.record.call_args[0][0], "WARN")
+
+    def test_frozen_frame_not_warned(self):
+        """image_bytes 非空 = capture_toast 在读已定格的帧，读空是合法结果，不告警。"""
+        t = self._mk()
+        self.assertEqual(t.ocr(100, 200, image_bytes=t._png), [])
+        t.record.assert_not_called()
+
+    def test_nonempty_custom_region_no_warn(self):
+        t = self._mk(texts=("50",))
+        self.assertEqual(len(t.ocr(100, 200)), 1)
+        t.record.assert_not_called()
+
+
+# ── 记录清理的调用时机：必须在 finish()，不能在建档路径上 ──────────────
+class TestRecordCleanupTiming(unittest.TestCase):
+    """旧记录（含报告/截图）只能在**本次记录完整落库之后**才删。
+
+    两处清理同一原则（2026-09-15 改）：
+      ① `drop_previous_cases`    —— 原在 `TestCase.__init__`
+      ② `cleanup_iterated_cases` —— 原在 `RecordDB.start_case`
+    在"开始"处删 = 用例一开跑就销毁上次的好记录 + 报告 + 截图；本次若被杀
+    （套件超时 / Ctrl-C / 断连 / 用例崩）→ 旧记录与新记录**两边都不剩**。
+    实测代价：一次被中断的套件把 168-177 共 8 个用例清成空壳；178 的 09-11 基线
+    也这样丢过一次（备份早于实战，救不回来）。
+    """
+
+    # 调用点守卫用的字面量：一律带 `self.` 调用前缀，注释里只写方法名不会命中
+    CALL_DROP = "self._db.drop_previous_cases("
+    CALL_ITER = "self._db.cleanup_iterated_cases("   # test_framework.finish() 里
+    CALL_ITER_DB = "self.cleanup_iterated_cases("    # RecordDB 内部若调用即此形式
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.rec = db.RecordDB(os.path.join(self.tmp, "t.db"))
+
+    def tearDown(self):
+        import shutil
+        self.rec.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _done_record(self, name="联想日历_178", sp="/w/cases/178.py"):
+        """造一条"跑完了"的记录。"""
+        cid = self.rec.start_case(name, "dev-1", user_input="用例", script_path=sp)
+        self.rec.finish_case(cid, "/w/reports/178_报告.md", "ok",
+                             final_status="PASS", package="com.zui.calendar")
+        return cid
+
+    def _ids(self):
+        return [r[0] for r in self.rec._connect().execute(
+            "SELECT id FROM cases ORDER BY id")]
+
+    def test_start_case_keeps_previous(self):
+        """建档**不**清旧记录 —— 中断时旧记录必须还在（本次回归的核心）。"""
+        old = self._done_record()
+        new = self.rec.start_case("联想日历_178", "dev-1", user_input="用例",
+                                  script_path="/w/cases/178.py")
+        self.assertEqual(self._ids(), [old, new])
+        self.assertEqual(self.rec.get_case(old)["final_status"], "PASS",
+                         "旧记录仍是完整态，没被本次的 start_case 动过")
+
+    def test_drop_after_finish_keeps_newest_only(self):
+        """跑完再删：原目标不变 —— 只剩最新一条。"""
+        old = self._done_record()
+        new = self._done_record()
+        self.rec.drop_previous_cases("联想日历_178", "/w/cases/178.py", keep_id=new)
+        self.assertEqual(self._ids(), [new])
+        self.assertNotIn(old, self._ids())
+
+    def test_iterated_cleanup_moved_to_finish(self):
+        """脚本被改过 → 旧记录是探索噪音；但必须"跑完才清"（A 方案）。
+
+        改前它在 `start_case` 里清：改完脚本单跑一次（最常见的开发节奏），
+        一开始就把旧记录 + 报告 + 截图删掉，本次中断 → 两边都不剩。
+        """
+        sp = os.path.join(self.tmp, "178.py")
+        with open(sp, "w", encoding="utf-8") as f:
+            f.write("# v1\n")
+        old = self._done_record(sp=sp)
+        time.sleep(1.1)                 # 比较是秒级：确保改脚本后 mtime 前进
+        with open(sp, "w", encoding="utf-8") as f:
+            f.write("# v2\n")           # 脚本被改过 → 旧记录成为探索噪音
+
+        new = self.rec.start_case("联想日历_178", "dev-1", user_input="用例",
+                                  script_path=sp)
+        self.assertIn(old, self._ids(), "建档不许清：中断时旧记录必须留得住")
+
+        self.rec.finish_case(new, "/w/reports/178_报告.md", "ok",
+                             final_status="PASS", package="com.zui.calendar")
+        self.assertEqual(self.rec.cleanup_iterated_cases(sp, "dev-1", new), 1)
+        self.assertEqual(self._ids(), [new])
+
+    def test_iterated_cleanup_keeps_suite_records(self):
+        """套件记录与"本次是套件跑"两种情况都不动探索记录。"""
+        sp = os.path.join(self.tmp, "178.py")
+        with open(sp, "w", encoding="utf-8") as f:
+            f.write("# v1\n")
+        suite = self.rec.start_case("套件_178", "dev-1", user_input="用例",
+                                    script_path=sp, suite_id=7)
+        self.rec.finish_case(suite, "/w/s.md", "ok", final_status="PASS")
+        time.sleep(1.1)
+        with open(sp, "w", encoding="utf-8") as f:
+            f.write("# v2\n")
+        new = self.rec.start_case("联想日历_178", "dev-1", user_input="用例",
+                                  script_path=sp)
+        self.rec.finish_case(new, "/w/r.md", "ok", final_status="PASS")
+        # 本次（exclude_id）本身是套件记录 → 完全不清
+        self.assertEqual(self.rec.cleanup_iterated_cases(sp, "dev-1", suite), 0)
+        # 本次非套件 → 可清，但套件记录（suite_id 非空）不在清理范围内
+        self.assertEqual(self.rec.cleanup_iterated_cases(sp, "dev-1", new), 0)
+        self.assertIn(suite, self._ids())
+
+    def test_cleanup_keeps_current_report(self):
+        """旧记录的"同前缀报告备份"清理不许删掉**本次刚写的**报告。
+
+        报告名 `<name>_报告.md` 是**共享**的（finish() 的既定语义：重跑覆盖），
+        而该清理按名字前缀扫目录 —— 一旦挪到 finish() 之后，旧记录的产物清理
+        就会把本次报告一起删掉。2026-09-15 实测：183 记录在、报告消失（连
+        时间戳备份一起，0 个残留）。
+        """
+        rdir = os.path.join(db.default_test_dir(), "storage", "reports")
+        os.makedirs(rdir, exist_ok=True)
+        name = "_unittest_清理守卫"
+        rp = os.path.join(rdir, f"{name}_报告.md")
+        bak = os.path.join(rdir, f"{name}_20260101_000000_报告.md")
+        try:
+            old = self.rec.start_case(name, "dev-1", script_path="/w/x.py")
+            self.rec.finish_case(old, rp, "old", final_status="FAIL")
+            with open(bak, "w", encoding="utf-8") as f:
+                f.write("old backup\n")          # 旧记录留下的时间戳备份
+
+            new = self.rec.start_case(name, "dev-1", script_path="/w/x.py")
+            self.rec.finish_case(new, rp, "new", final_status="PASS")
+            with open(rp, "w", encoding="utf-8") as f:
+                f.write("current report\n")      # 本次刚写的报告
+
+            self.rec.drop_previous_cases(name, "/w/x.py", keep_id=new)
+            self.assertTrue(os.path.exists(rp),
+                            "本次刚写的报告不许被旧记录的产物清理删掉")
+            self.assertFalse(os.path.exists(bak),
+                             "旧记录自己的时间戳备份仍应清掉")
+        finally:
+            for p in (rp, bak):
+                if os.path.exists(p):
+                    os.remove(p)
+
+    def test_call_site_is_finish_not_init(self):
+        """调用点守卫：两处清理都必须在 `finish()` 之后，不许留在建档路径上。
+
+        时机没有对外钩子，只能做**源码级**断言 —— 把"时机回归"从一次数据事故
+        降级成一条单测红。
+        """
+        with open(os.path.join(_ROOT, "framework", "test_framework.py"),
+                  encoding="utf-8-sig") as f:
+            src = f.read()
+        head, sep, tail = src.partition("def finish(")
+        self.assertTrue(sep, "在 test_framework.py 里找不到 def finish(")
+        for call in (self.CALL_DROP, self.CALL_ITER):
+            self.assertNotIn(
+                call, head,
+                f"{call} 不许在 __init__ 侧调用：用例一开始就销毁上次记录 + 报告 + 截图")
+            self.assertIn(
+                call, tail,
+                f"{call} 必须在 finish() 里调用：跑完才用新记录替换旧记录")
+
+        # db.py 侧：迭代清理不许退回 start_case（那是"开始即销毁"的老位置）
+        with open(os.path.join(_ROOT, "framework", "db.py"),
+                  encoding="utf-8-sig") as f:
+            db_src = f.read()
+        body = db_src.split("def start_case(", 1)[1].split("\n    def ", 1)[0]
+        self.assertNotIn(self.CALL_ITER_DB, body,
+                         "cleanup_iterated_cases 不许在 start_case 里调用")
+
+
+# ── P1-6：case_metrics —— duration_sec 是唯一性能口径 ──────────────
+class TestCaseMetrics(unittest.TestCase):
+    """度量落 append-only 表：cases 被 drop_previous_cases 删旧行 → 没趋势。
+
+    这正是本表存在的理由：178 的 09-11 记录已被下一次运行连同报告一起删掉，
+    "改前 vs 改后"只能靠这里累积。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.rec = db.RecordDB(os.path.join(self.tmp, "m.db"))
+
+    def tearDown(self):
+        import shutil
+        self.rec.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_empty(self):
+        h = self.rec.health_check()
+        self.assertEqual(h["samples"], 0)
+        self.assertEqual(h["duration_p90"], 0)
+
+    def test_roundtrip_and_percentiles(self):
+        for d in (10.0, 20.0, 30.0, 40.0):
+            self.rec.record_metrics("/w/178.py", "dev-1", d,
+                                    ocr=0, derived=58, dump=116)
+        h = self.rec.health_check()
+        self.assertEqual(h["samples"], 4)
+        self.assertEqual(h["duration_p50"], 30.0)
+        self.assertEqual(h["duration_p90"], 40.0)
+        self.assertEqual(h["dump_p90"], 116)
+
+    def test_none_script_path_skipped(self):
+        """直跑临时脚本无 script_path → 跳过（列是 NOT NULL）。"""
+        self.assertIsNone(self.rec.record_metrics(None, "dev", 1.0))
+        self.assertEqual(self.rec.health_check()["samples"], 0)
+
+    def test_accumulates_same_case(self):
+        """核心价值：同一用例重复跑，度量累积而非被覆盖。"""
+        self.rec.record_metrics("/w/178.py", "dev", 311.5)
+        self.rec.record_metrics("/w/178.py", "dev", 205.0)
+        self.assertEqual(self.rec.health_check()["samples"], 2)
+
+    def test_rotation_columns_roundtrip(self):
+        """方向列可写可读：起止不同 → rotation_changed 计数 +1。"""
+        self.rec.record_metrics("/w/178.py", "dev", 311.5, rot_start=0, rot_end=1)
+        h = self.rec.health_check()
+        self.assertEqual(h["rotation_changed"], 1)
+        row = self.rec._connect().execute(
+            "SELECT rotation_start, rotation_end FROM case_metrics").fetchone()
+        self.assertEqual(tuple(row), (0, 1))
+
+    def test_rotation_same_not_counted(self):
+        self.rec.record_metrics("/w/178.py", "dev", 1.0, rot_start=1, rot_end=1)
+        self.assertEqual(self.rec.health_check()["rotation_changed"], 0)
+
+    def test_rotation_none_not_counted(self):
+        """None ≠ 0：探测失败 / 老库补列不能算成"方向变过"。"""
+        self.rec.record_metrics("/w/a.py", "dev", 1.0, rot_start=None, rot_end=1)
+        self.rec.record_metrics("/w/b.py", "dev", 1.0, rot_start=0, rot_end=None)
+        self.rec.record_metrics("/w/c.py", "dev", 1.0)
+        self.assertEqual(self.rec.health_check()["rotation_changed"], 0)
+
+    def test_rotation_changed_counted_among_others(self):
+        self.rec.record_metrics("/w/a.py", "dev", 1.0, rot_start=0, rot_end=1)
+        self.rec.record_metrics("/w/b.py", "dev", 1.0, rot_start=1, rot_end=1)
+        self.rec.record_metrics("/w/c.py", "dev", 1.0, rot_start=1, rot_end=0)
+        h = self.rec.health_check()
+        self.assertEqual(h["samples"], 3)
+        self.assertEqual(h["rotation_changed"], 2)
+
+    def test_started_at_is_iso_string(self):
+        """started_at 必须是 ISO 字符串：float 会让 ORDER BY started_at 退化。"""
+        self.rec.record_metrics("/w/178.py", "dev", 1.0)
+        at = self.rec._connect().execute(
+            "SELECT started_at FROM case_metrics").fetchone()[0]
+        self.assertIsInstance(at, str)
+        self.assertIn("-", at)
+
+
+@unittest.skipIf(tf is None, "需要 uiautomator2（用工作区 venv 跑本测试）")
+class TestDeviceRotation(unittest.TestCase):
+    """真实旋转探测：解析 `dumpsys window displays` + 语义映射。
+
+    为什么必须有这条：方向一直是"看不见的变量"——178 实测锁了竖屏、冷启动把
+    accelerometer_rotation 改回 1、全用例横屏跑完仍 PASS（坐标全部现场派生），
+    而**没有任何地方记录过方向变过**。这个类把"看得见"补上。
+    """
+
+    # 真实输出片段（2026-09-14 实测，TB323FU / Android 17）
+    SAMPLE = (
+        "Display: mDisplayId=0 (organized)\n"
+        "  init=1904x3040 440dpi mMinSizeOfResizeableTaskDp=220 "
+        "cur=3040x1904 app=3040x1904 rng=1904x1904-3040x3040\n"
+        "  overrideConfig={1.0 ?mcc0mnc [zh_CN_#Hans] winConfig={ "
+        "mBounds=Rect(0, 0 - 3040, 1904) "
+        "mDisplayRotation=ROTATION_90 mRotation=ROTATION_90}}\n"
+        "  mRotation=1 mDeferredRotationPauseCount=0\n"
+    )
+
+    def test_parses_rotation_from_real_dump(self):
+        m = tf.TestCase._ROT_RE.search(self.SAMPLE)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), "1")
+
+    def test_does_not_match_word_form(self):
+        """`mRotation=ROTATION_90`（winConfig 里的写法）不能被当成数字。"""
+        self.assertIsNone(tf.TestCase._ROT_RE.search(
+            "  overrideConfig={ mRotation=ROTATION_90}}"))
+
+    def test_fallback_matches_standalone_line(self):
+        out = "  mRotation=0\n"
+        self.assertIsNone(tf.TestCase._ROT_RE.search(out))
+        m = tf.TestCase._ROT_RE_FALLBACK.search(out)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), "0")
+
+    def test_rot_name_semantics(self):
+        """0/2 竖、1/3 横 —— 与设备实测一致（accel=0/user=0 → mRotation=0 竖屏）。"""
+        self.assertEqual(tf._rot_name(0), "竖屏")
+        self.assertEqual(tf._rot_name(2), "竖屏(反向)")
+        self.assertEqual(tf._rot_name(1), "横屏")
+        self.assertEqual(tf._rot_name(3), "横屏(反向)")
+        self.assertIn("9", tf._rot_name(9))
+
+    def test_returns_none_when_adb_raises(self):
+        """探测失败必须返回 None 而不是抛：收尾阶段绝不能被它中断。"""
+        t = object.__new__(tf.TestCase)
+
+        def _boom(*a, **k):
+            raise RuntimeError("adb 挂了")
+
+        t.adb_shell = _boom
+        self.assertIsNone(t.device_rotation())
+
+    def test_returns_none_on_empty_or_garbage(self):
+        t = object.__new__(tf.TestCase)
+        t.adb_shell = lambda *a, **k: ""
+        self.assertIsNone(t.device_rotation())
+        t.adb_shell = lambda *a, **k: "no rotation info here"
+        self.assertIsNone(t.device_rotation())
 
 
 if __name__ == "__main__":

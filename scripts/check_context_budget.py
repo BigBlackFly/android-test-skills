@@ -35,10 +35,17 @@ import sys
 # 模式说明：
 #   无 * → 精确匹配（相对仓库根）
 #   含 * → glob 匹配（相对仓库根）
+#
+# ⚠️ **App 卡（`knowledge/<包名>.md`）刻意不在此列**（2026-09-14 人确认）：
+#   它们是**工作区资产** —— `resolve_knowledge_dir()` 工作区优先，setup 时从 skill 包
+#   复制一次，之后运行时用的**永远是工作区那份**。而 CI 跑在仓库上、看不到工作区，
+#   只能查到这份"种子副本" → **闸门卡住的是一份运行时不生效的文件，红灯指错对象**
+#   （实测：卡被改到 518 行时，红的是种子副本，真正生效的工作区副本无任何度量）。
+#   App 卡体积改为**可见指标**：见 `report_app_cards()`（只报数、不设闸门）。
 BUDGETS = [
     ("SKILL.md",                    280),
     ("knowledge/_system.md",        200),
-    ("knowledge/*.md",              400),
+    ("knowledge/_*.md",             400),   # 内置卡（_system / _template）
     ("knowledge/scenarios/*.md",    80),
     ("docs/*.md",                   400),
 ]
@@ -120,6 +127,29 @@ def check(root=None):
     return errors, warnings, len(budgets)
 
 
+def report_app_cards(root=None):
+    """App 卡体积：**只报数、不设闸门**（2026-09-14 人确认）。
+
+    为什么不做成闸门：CI 看到的是"种子副本"，运行时用的是工作区那份
+    （见 BUDGETS 上方注释）→ 做成闸门只会红灯指错对象。
+    但每张 App 卡都是 Agent 每次任务可能要读的东西（400 行 ≈ 6.5k tokens），
+    体积值得盯 —— 所以报数，让它可见。
+    """
+    if root is None:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    rows = []
+    for fp in sorted(glob.glob(os.path.join(root, "knowledge", "*.md"))):
+        base = os.path.basename(fp)
+        if base.startswith("_"):
+            continue                      # 内置卡（_system / _template）走 BUDGETS
+        rows.append((base, _line_count(fp) or 0, _token_estimate(fp)))
+    if not rows:
+        return
+    print("\n📄 App 卡体积（**种子副本**，仅参考；运行时用的是工作区那份）：")
+    for base, lines, tokens in rows:
+        print(f"   {base}: {lines} 行 (~{tokens} tokens)")
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     root = sys.argv[1] if len(sys.argv) > 1 else None
@@ -129,6 +159,7 @@ def main():
         print(w)
     for e in errors:
         print(e)
+    report_app_cards(root)
     if warnings:
         print(f"\n⚠️ {len(warnings)} 个文件接近预算上限")
     if errors:

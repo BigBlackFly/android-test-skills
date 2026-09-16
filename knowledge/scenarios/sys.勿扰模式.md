@@ -8,7 +8,7 @@
 判定命令: settings get global zen_mode
 判定说明: 0=关闭，非0=开启（1=仅允许重要通知，2=完全静音）
 
-<!-- AI 检索用：grep -rl "<触发词>" knowledge/scenarios/ -->
+<!-- AI 检索用：按触发词检索 knowledge/scenarios/（Windows Select-String / *nix grep -rl） -->
 触发词:
 - 勿扰模式
 - 勿扰

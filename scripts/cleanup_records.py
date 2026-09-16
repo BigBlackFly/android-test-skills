@@ -119,6 +119,35 @@ def main():
     conn.close()
     print(f"清理前 cases: {total_before} 条\n")
 
+    # ── ③ 空记录：被中断的运行（有 cases 行、无任何 steps）────
+    # 形态：`start_case` 插了行，但进程被杀 → `finish_case` 从没跑到 →
+    # final_status 为 NULL 且没有任何子表。
+    # ⚠️ 这类行**不能靠②的"留最新"清掉** —— 它们恰恰是 id 最大的那批。
+    #    实测（2026-09-14）：一次被中断的套件留下 8 条 NULL 行，全都比同名用例
+    #    已完成的记录新；单跑②会把 8 条好记录删掉、把 8 条空壳留下。
+    #    所以本规则必须排在②**之前**，且其 id 要进 junk_set。
+    # 判据**只认"没有 final_status"**：跑完的用例必然有结论（`finish_case` 一定写），
+    # 没结论 = 这次没跑完 → 它的记录与报告都不可信。
+    # ⚠️ 别拿"无 steps"当判据（本规则第一版就是这么写的，实测漏判）：
+    #    被杀的运行时**往往已经写了若干 steps**（183 被杀时已写 40 行）；
+    #    ③ 漏掉它之后，② 的"留最新"反而把**上一次的好记录删掉、把空壳留下**
+    #    —— 2026-09-15 实测踩到一次，所以判据改为只认 final_status。
+    # ⚠️ 别在用例**正在跑**的时候执行本脚本：会把在跑那条（还没有结论）一起删掉。
+    interrupted = []
+    conn = sqlite3.connect(DB_PATH)
+    for cid, name, fs in conn.execute(
+            "SELECT id, name, final_status FROM cases ORDER BY id").fetchall():
+        if fs is not None and str(fs).strip():
+            continue                       # 有结论 = 跑完过
+        interrupted.append((cid, name))
+    conn.close()
+    print(f"【③ 未跑完的记录（无 final_status）】{len(interrupted)} 条")
+    for cid, nm in interrupted:
+        print(f"   #{cid:<4} {nm:<28}")
+    if apply_:
+        files = sum(_delete(cid) for cid, _ in interrupted)
+        print(f"   → 已删除 {len(interrupted)} 条记录，连带清理 {files} 个产物文件/目录")
+
     # ── ① 无 USER_INPUT 的辅助脚本记录 ────────────────────
     junk = _case_ids_for(
         "SELECT id FROM cases WHERE user_input IS NULL OR TRIM(user_input)=''"
@@ -136,7 +165,7 @@ def main():
     # ── ② 同用例重复执行，只留最新 ────────────────────────
     # 注意：① 里已删的 id 不能重复统计/删除（如 补采D_185_置灰逻辑 既无
     # USER_INPUT 又是重复执行，会同时命中两条规则）。
-    junk_set = set(junk)
+    junk_set = set(junk) | {cid for cid, _ in interrupted}
     conn = sqlite3.connect(DB_PATH)
     groups = conn.execute(
         "SELECT name, script_path, COUNT(*) n FROM cases"

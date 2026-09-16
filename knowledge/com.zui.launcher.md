@@ -1,10 +1,9 @@
 # 联想桌面（ZUI Launcher）
 
-<!-- App 卡（MD 格式）。机器只 grep/阅读，不 parse 结构。 -->
+<!-- App 卡（MD 格式）。机器靠关键词检索 + 只读命中片段，不 parse 结构。 -->
 
 - **app**: `com.zui.launcher`
 - **name**: 联想桌面 / ZUI Launcher
-- **验证版本**: ZUXOS 2.5.02.160 开发版（TB323FU / Android 17 / 1904×3040 竖屏）
 - **最近验证**: 2026-09-09（dock「所有应用」入口、APP 列表、长按菜单 实测通过）
 
 > 注意：`com.tblenovo.center` 是「服务与反馈」，**不是**桌面；桌面包名是 `com.zui.launcher`。

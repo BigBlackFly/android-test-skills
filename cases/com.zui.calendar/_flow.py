@@ -17,6 +17,14 @@
   tap_rightmost_icon(t)         顶栏最右图标坐标（识别结果页禁用）
   top_bar_icons(t)              顶栏图标列表（调试辅助）
 
+前置状态检查（2026-09-14）：每个 goto_* 带 skip_if_ready 开关，**默认 False
+  （保持既有语义）**。传 True 时：已在目标页 → 直接返回，不冷启动、不重建前置
+  （重跑调试省掉 pm_clear + 引导弹窗链，实测约 100s）；在上一跳 → 只走最后一跳
+  （由内层 goto_* 的检查自然完成）。
+  ⚠️ 跳过的是「冷启动 + 重建」，**不重置页内已被改动的数据** —— 断言默认值的
+  用例（178 的「默认 50 分钟」、179 的时间默认值）必须保持 False，否则重跑会拿
+  上一轮改过的值当默认值，断言变成间歇性 FAIL。
+
 权限测试（169 系列共享；拆独立用例避免 USER_FIXED 级联）：
   navigate_to_course_table(t)   启动 App + 过首启弹窗 + 到课程表空状态页
   test_camera(t, allow)         相机权限 允许/拒绝 单行为测试
@@ -41,6 +49,14 @@ except ImportError:  # 框架不可用时仍允许本模块被导入检查
     TestCase = object
 
 PKG = "com.zui.calendar"
+
+# 前置状态检查的全局开关（调试循环用）：DSH_SKIP_IF_READY=1 时，未显式传
+# skip_if_ready 的 goto_* 调用会自动跳过「已在目标页」的前置。
+# 正式回归不带该变量 → 语义与历史完全一致。
+# 为什么是环境变量而不是逐用例改代码：是否可跳过取决于**运行期**「设备当前停在
+# 哪一页」，同一用例跑成功/跑失败时停的页不同 —— 它是运行期属性，不是用例的静态
+# 属性，故开关应由"跑的人"给。详见各 goto_* 的 docstring 与 plan/smart-skill-roadmap-v5.md A4.1。
+_SKIP_IF_READY = os.environ.get("DSH_SKIP_IF_READY") == "1"
 
 # 图库导入用到的素材与控件
 IMG_PATH = "/sdcard/Pictures/日历/课程表.png"
@@ -197,9 +213,23 @@ def _dismiss_permission_guide(t, timeout=8):
 
 
 
-def goto_课程表空状态(t, pm_clear=True):
-    """主页 → 更多 → 课程表，保证停在空状态。返回是否成功。"""
+def goto_课程表空状态(t, pm_clear=True, skip_if_ready=None):
+    """主页 → 更多 → 课程表，保证停在空状态。返回是否成功。
+
+    skip_if_ready=None（默认）：跟随环境变量 DSH_SKIP_IF_READY（未设置 = False，
+    与历史语义完全一致）；显式传 True/False 时优先于环境变量。
+
+    skip_if_ready=True 时：设备已停在空状态 → **直接返回**，不冷启动、不重建前置
+    —— 重跑调试省掉整条冷启动链（实测 35.7s → 0.6s）。
+    ⚠️ 跳过只保证「落在目标页」，**不重置页内已被改动的数据**：断言默认值 / 首启
+    弹窗的调用方必须显式传 False（178 / 179 即属此类）。
+    """
+    if skip_if_ready is None:
+        skip_if_ready = _SKIP_IF_READY
     _ensure_step(t, "前置-进入课程表空状态")
+    if skip_if_ready and _on_课程表空状态(t):
+        t.record("INFO", "已在课程表空状态，跳过冷启动+重建前置（skip_if_ready）")
+        return True
     restart_calendar(t, pm_clear=pm_clear)
     if not tap_more_menu(t):
         t.blocked("无法打开'更多'菜单")
@@ -215,9 +245,21 @@ def goto_课程表空状态(t, pm_clear=True):
     return True
 
 
-def goto_手动创建课程表(t, pm_clear=True):
-    """课程表空状态 → 手动创建课程表页。"""
-    if not goto_课程表空状态(t, pm_clear=pm_clear):
+def goto_手动创建课程表(t, pm_clear=True, skip_if_ready=None):
+    """课程表空状态 → 手动创建课程表页。
+
+    skip_if_ready=None（默认）：跟随环境变量 DSH_SKIP_IF_READY（未设置 = False）。
+    skip_if_ready=True 时：已在手动创建页（EditTimetableActivity）→ 直接返回；
+    否则交由 goto_课程表空状态 的检查决定「只走最后一跳」还是「走完整前置」。
+    ⚠️ 跳过不重置页内已被改动的数据，而 178/179 断言该页的「默认值」（课时长 /
+    课间 / 节数 / 时间），重跑会把上轮改过的值当默认值 → FAIL。这两类必须 False。
+    """
+    if skip_if_ready is None:
+        skip_if_ready = _SKIP_IF_READY
+    if skip_if_ready and _on_手动创建页(t):
+        t.record("INFO", "已在手动创建课程表页，跳过前置（skip_if_ready）")
+        return True
+    if not goto_课程表空状态(t, pm_clear=pm_clear, skip_if_ready=skip_if_ready):
         return False
     if not t.tap_rid(BTN_CREATE_MANUALLY, silent=True):
         t.blocked("未找到'手动创建课程表'按钮")
@@ -234,6 +276,27 @@ def _on_确认页(t):
     except Exception:
         pass
     return False
+
+
+def _on_课程表空状态(t):
+    """设备当前是否已停在「课程表 - 还未添加课程表」空状态（重跑跳过前置用）。"""
+    try:
+        if "还未添加课程表" in " ".join(t.screen_text()):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _on_手动创建页(t):
+    """设备当前是否已停在「手动创建课程表」页（新建课程表页 = EditTimetableActivity）。
+
+    与 goto_手动创建课程表 的落点一致：点 btnCreateManually 后即进入该页。
+    """
+    try:
+        return "EditTimetableActivity" in t.current_activity()
+    except Exception:
+        return False
 
 
 # ── 图库选图（视觉排序 + 裁剪页预检 + 双态等待）────────────────────────
@@ -331,7 +394,7 @@ def _ensure_grid(t, wait_s=12):
     return False
 
 
-def goto_图库导入_基本信息确认页(t, pm_clear=True, timeout=60, skip_if_ready=False):
+def goto_图库导入_基本信息确认页(t, pm_clear=True, timeout=60, skip_if_ready=None):
     """完整图库导入链路 → 到达「确认课程表基本信息」页。
 
     对应 knowledge/com.zui.calendar.md 的「标准链路/图库导入创建课程表」。
@@ -344,14 +407,17 @@ def goto_图库导入_基本信息确认页(t, pm_clear=True, timeout=60, skip_i
       通用解析失败框，不是"选错图"专属）。解析总次数上限 MAX_PICK_ATTEMPTS，
       用尽 BLOCKED（归因"未找到可用课程表"，与网络无关）。
 
+    skip_if_ready=None（默认）：跟随环境变量 DSH_SKIP_IF_READY（未设置 = False）。
     skip_if_ready=True：设备已在确认页时跳过 pm_clear + 导入直接返回 True，
-    供失败重跑省前置（1-2 分钟）；前提不满足自动回落完整导入。
+    供失败重跑省前置；前提不满足自动回落完整导入。
     """
+    if skip_if_ready is None:
+        skip_if_ready = _SKIP_IF_READY
     if skip_if_ready and _on_确认页(t):
         t.record("INFO", "设备已在确认页，跳过 pm_clear+图库导入（skip_if_ready）")
         return True
 
-    if not goto_课程表空状态(t, pm_clear=pm_clear):
+    if not goto_课程表空状态(t, pm_clear=pm_clear, skip_if_ready=skip_if_ready):
         return False
 
     # 图片必须先被 MediaStore 收录，否则 PhotoPicker 显示"无相册"
@@ -613,6 +679,82 @@ def test_gallery(t, allow):
         t.screenshot("图库_拒绝")
 
 
+def goto_home(t, rounds=5):
+    """把日历带回**主页**（`iv_more` 所在页）。返回是否到达。
+
+    为什么需要：185/186 原来只 `launch_app` 就假设"落在主页"，但套件里上一个
+    用例可能把它停在深层页（时间设置页 / 编辑页 / 周视图）→ 找不到 `iv_more`
+    → FAIL+BLOCKED（实测：185/186 在全量套件里 20 秒就结束，报告写"未找到首页
+    「更多」按钮"）。`launch_app` 是**恢复**前台，不是回主页。
+
+    路径（知识卡）：先关可能盖着的弹窗，再逐次 BACK —— 列表页 BACK 一次到周视图，
+    再 BACK 一次到日历主页。
+    """
+    t.observe_dialogs(rounds=2)
+    for _ in range(rounds):
+        if t.el_bounds(rid="com.zui.calendar:id/iv_more"):
+            return True
+        t.back()
+        time.sleep(1.1)
+        t.observe_dialogs(rounds=1)
+    return bool(t.el_bounds(rid="com.zui.calendar:id/iv_more"))
+
+
+# ── 备数据：确保 ≥2 个课程表（185/186 前置）──────────────────────
+RID_CREATE_MANUALLY = "com.zui.calendar:id/btnCreateManually"
+RID_ADD_SCHEDULE = "com.zui.calendar:id/action_add_schedule"
+RID_ET_TABLE_NAME = "com.zui.calendar:id/et_schedule_name"
+RID_TABLE_SETTINGS = "com.zui.calendar:id/action_curriculum_table_settings"
+RID_EMPTY_VIEW = "com.zui.calendar:id/emptyView"
+RID_SAVE_VIEW = "com.zui.calendar:id/save_view"
+
+
+def table_names(t):
+    """当前页上的课程表名（不在列表页 → 空列表）。"""
+    return [n["text"] for n in t.find_nodes(rid_re="tv_schedule_name") if n["text"]]
+
+
+def ensure_two_tables(t, want=2, max_new=3):
+    """确保设备上有 ≥want 个课程表（185/186 的前置数据）。返回课程表名列表。
+
+    为什么必须自己补建：这两个用例的前提是"设备中已添加多个课程表"，而套件里
+    前序用例会 `pm_clear` → 进课程表落的是**引导式空状态页**（「还未添加课程表」），
+    那页**没有**列表页顶栏的加号 `action_add_schedule`。用例原来先去找列表页
+    → 必然 FAIL+BLOCKED（实测：185/186 放进全量套件后 20 秒就结束）。
+
+    三种落点分别处理 —— 且**建完的落点是周视图**（知识卡：点「完成」保存后到
+    TimetableActivity，不是列表页），所以每一轮都要重新导航，不能按次数连建：
+      · 空状态页（`emptyView` 在）→ `btnCreateManually`（该页唯一入口）
+      · 列表页 → `action_add_schedule`
+      · 周视图 → 顶栏 `action_curriculum_table_settings` 回列表页
+    """
+    for _ in range(max_new + 1):
+        names = table_names(t)
+        if len(names) >= want:
+            return names
+        if not t.tap_rid(RID_TABLE_SETTINGS, silent=True):
+            t.el_bounds(rid=RID_EMPTY_VIEW)          # 空状态页：原地即可
+        time.sleep(2)
+        entry = (RID_CREATE_MANUALLY
+                 if t.el_bounds(rid=RID_CREATE_MANUALLY) else RID_ADD_SCHEDULE)
+        if not t.tap_rid(entry, silent=True):
+            return table_names(t)                    # 进不去新建页 → 交用例报 BLOCKED
+        time.sleep(3)
+        if not t.el_bounds(rid=RID_ET_TABLE_NAME):
+            return table_names(t)
+        # 表名必须**全局唯一**：用 len(names) 编号会在"列表读取滞后/上次残留"
+        # 时造出重名表 → 用例按名字区分"当前/非当前"时判错（实测 186 因此
+        # others 判空、185 的置灰断言连挂 7 条）。用时间戳保证唯一。
+        t.input_text(RID_ET_TABLE_NAME, f"备数据表{int(time.time()) % 100000}")
+        # 保存 = toolbar 的 save_view（文本「完成」），不是 btn_finish
+        if not (t.tap_rid(RID_SAVE_VIEW, silent=True)
+                or t.tap_text("完成", wait=2, silent=True)):
+            return table_names(t)
+        time.sleep(3)
+        t.observe_dialogs(rounds=2)
+    return table_names(t)
+
+
 # ── 弹框滚轮通用工具（178 实战沉淀）───────────────────────────
 def _parse_panel(t):
     """读弹框 customPanel bounds。"""
@@ -632,6 +774,12 @@ def wheel_tap_steps(t, col_x, n, up=True, panel=None):
 
     约定方向：上=减小、下=增大；每档 ≈ 5 分钟（时长/课间）。
     panel=(x1,y1,x2,y2)，缺省时现场从当前弹框取。
+
+    ⚠️ **点按会偶发丢档**（轮子在惯性/动画未 settle 时被吃掉）：实测 178 的
+    "拨到上端 + 越界回绕" 5 次跑出 **2 通过 3 失败**，根因是前一步少拨一档 →
+    后一步的回绕断言跟着假 FAIL。所以：① 档间延时放宽到 0.9s；
+    ② **多步拨动后不要直接断言"下一步应该到 X"** —— 弹框内读不到 Canvas 文字，
+    必须点确定后从 value_rid 读回核对，不到位就补拨。
     """
     if panel is None:
         panel = _parse_panel(t)
@@ -639,7 +787,7 @@ def wheel_tap_steps(t, col_x, n, up=True, panel=None):
     step_px = int((panel[3] - panel[1]) / 3)
     for _ in range(n):
         t.tap_xy(col_x, cy_line - step_px if up else cy_line + step_px, observe=False)
-        time.sleep(0.6)
+        time.sleep(0.9)
 
 
 def apply_and_read(t, value_rid):
