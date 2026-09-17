@@ -301,8 +301,10 @@ def run():
         grayed_ok = True
     else:
         t.record("FAIL",
-                 f"课程表名称为空时完成按钮仍可点击（应置灰）: enabled={en_empty or '未知'}, "
-                 f"clickable={clk_empty or '未知'} —— 必填校验缺失")
+                 f"课程表名称为空时完成按钮未置灰（需求要求置灰）: "
+                 f"enabled={en_empty or '未知'}, clickable={clk_empty or '未知'}"
+                 " —— 与需求『名称/时间都填了才可点完成』的**表现形式**不符；"
+                 "是否存在点击级校验请看下一条证据")
         grayed_ok = False
     if not grayed_ok:
         # 与规格『置灰』不符 → 补行为证据：空名点「完成」是否被校验拦截
@@ -313,6 +315,8 @@ def run():
         if t.tap_rid(FINISH, observe=False, silent=True):
             texts, _shot = t.capture_toast()
             hit = [s for s in texts if s.strip()]
+            # settle 属"合理"：等的是**页面有没有离开**（否定条件）——"某个东西
+            # 不出现"没法用 wait_* 表达（wait_rid 会立刻命中已存在的 NAME）。
             time.sleep(1)
             on_page = bool(t.el_bounds(rid=NAME)) and "新建课程表" in " ".join(t.screen_text())
             t.record("INFO" if on_page else "FAIL",

@@ -7,6 +7,8 @@
 #   pwsh -File run_case.ps1 -Case "D:\mycase.py"             # 绝对路径直接用
 #   pwsh -File run_case.ps1 -List                            # 只列出可用用例
 #   pwsh -File run_case.ps1 -Case "172"                      # 模糊匹配，自动补 .py
+#   pwsh -File run_case.ps1 -Case "178.py" -StopAfter 2      # 只跑前 2 步（局部执行）
+#   pwsh -File run_case.ps1 -Case "178.py" --stop-after 2    # 同上，python 原生写法也可
 #
 # 等价于 macOS/Linux 的:
 #   cd ~/android-test-skills-data/framework && .venv/bin/python run_case.py <用例>
@@ -19,7 +21,15 @@ param(
     [string]$Workspace = $(if ($env:DSH_WORKSPACE_DIR) { $env:DSH_WORKSPACE_DIR }
                            else { Join-Path $HOME 'android-test-skills-data' }),
     [string]$Python,
-    [switch]$List
+    # 只跑前 N 步（局部执行：退出码 0、不入库）。0 = 不限制。
+    [int]$StopAfter = 0,
+    [switch]$List,
+    # 其余参数**原样透传**给 framework\run_case.py。
+    # 为什么需要：本 wrapper 的承诺是"等价于 python run_case.py <用例>"，但缺这条时
+    # 任何 python 侧参数都会被 PowerShell 判成"找不到参数"直接拒收
+    # （2026-09-16 实测：`--stop-after 2` 让脚本**一行都没跑**，退出码 1 ——
+    #  看起来像"用例失败"，实际是参数没进去）。
+    [Parameter(ValueFromRemainingArguments = $true)][string[]]$Passthrough
 )
 
 $ErrorActionPreference = 'Stop'
@@ -180,7 +190,11 @@ try {
     # 显式声明 skill 包位置：工作区 framework 副本据此定位 cases/knowledge
     $env:DSH_SKILL_DIR = $SkillDir
     try {
-        & $VenvPy $runner $casePath
+        # 参数拼装：用例路径 + 局部执行 + 透传参数（顺序不敏感，run_case.py 自己解析）
+        $pyArgs = @($runner, $casePath)
+        if ($StopAfter -gt 0) { $pyArgs += @('--stop-after', "$StopAfter") }
+        if ($Passthrough)    { $pyArgs += $Passthrough }
+        & $VenvPy @pyArgs
         $code = $LASTEXITCODE
     } finally {
         $env:PYTHONUTF8 = $prevUtf8

@@ -20,6 +20,7 @@ import ast
 import importlib.util
 import logging
 import os
+import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -205,25 +206,278 @@ def _last_case():
     return getattr(tf, "LAST_CASE", None) if tf else None
 
 
-def _parse_args(argv):
-    """解析命令行参数，返回 (name, device)。
+def _parse_stop_after(raw):
+    """`--stop-after` 取值校验：必须是**正整数**。
 
-    支持: python run_case.py [--device SERIAL] <用例名>
-    device=None 时 TestCase 自动选唯一授权设备。
+    0/负数无意义（"一步都不跑"），非法值直接报错退出 —— **不静默忽略**：
+    调试开关被静默忽略的后果是"以为只跑了前 5 步、其实跑完了整个用例"，
+    比报错难查得多。
+    """
+    try:
+        n = int(str(raw).strip())
+    except (TypeError, ValueError):
+        n = 0
+    if n < 1:
+        print(f"--stop-after 需要正整数，收到: {raw!r}")
+        sys.exit(3)
+    return n
+
+
+def _parse_args(argv):
+    """解析命令行参数，返回 (name, device, stop_after)。
+
+    支持: python run_case.py [--device SERIAL] [--stop-after N] <用例名>
+    - device=None → TestCase 自动选唯一授权设备
+    - stop_after=N → 只跑前 N 步（局部执行：退出码 0、不入库；见
+      test_framework.PartialRun）。目的是把 edit-run 循环从分钟级压到秒级。
+    `--stop-after=5` 与 `--stop-after 5` 两种写法都接受。
     """
     args = list(argv[1:])
     device = None
+    stop_after = None
     i = 0
     while i < len(args):
-        if args[i] == "--device" and i + 1 < len(args):
+        a = args[i]
+        if a == "--device" and i + 1 < len(args):
             device = args[i + 1]
             args[i:i + 2] = []
+        elif a == "--stop-after" and i + 1 < len(args):
+            stop_after = _parse_stop_after(args[i + 1])
+            args[i:i + 2] = []
+        elif a.startswith("--stop-after="):
+            stop_after = _parse_stop_after(a.split("=", 1)[1])
+            args[i:i + 1] = []
         else:
             i += 1
     if not args:
-        print("用法: python run_case.py [--device SERIAL] <用例文件名或 com.zui.calendar/172.py>")
+        print("用法: python run_case.py [--device SERIAL] [--stop-after N] "
+              "<用例文件名或 com.zui.calendar/172.py>")
         sys.exit(3)
-    return args[0], device
+    return args[0], device, stop_after
+
+
+# ── P0a 执行时守门（plan/mechanism-over-prose-plan.md §八 P0a）──────────
+# 在**执行前**跑静态检查，级别定义：
+#   lint_case   → ERROR **拒跑**（退出码 3 = ERROR，与 EXIT_CODES 同构）；
+#                 HINT 仅打印（噪音型规则折叠，见 lint_case._QUIET_HINT_RULES）
+#   check_facts → **只作 WARN，永不拒跑**：它的语料是 probes/traces，而 probes
+#                 30 分钟即被 cleanup_probes 清掉 → "无语料"是常态，拿它拒跑
+#                 会把干净用例全拦下（§八 P0a 明确的 ⚠️）。
+# 辅助脚本（`_` 前缀）整个跳过：它们本就无 USER_INPUT，规则 1 不适用。
+# 逃生口：DSH_SKIP_GATES=1（仅调试用；正式回归不设）。
+GATE_EXIT_CODE = 3
+
+# 本次守门计数（供 RunMetrics 落库，§7.1「守门」维度）。
+# 模块级而非返回值：run_gates 的返回值是"放行/拒跑"的布尔语义，把计数塞进
+# 返回值会让每个调用点都得拆元组；这里与 test_framework.LAST_CASE 同一套路。
+LAST_GATE_STATS = {"lint_errors": None, "check_facts_suspects": None,
+                   "checked_words": None}
+
+
+def _reset_gate_stats():
+    for k in LAST_GATE_STATS:
+        LAST_GATE_STATS[k] = None
+
+
+def _storage_dir():
+    """工作区 storage/（守门读语料用；取不到时退回框架相对位置）。"""
+    try:
+        from db import default_test_dir
+        return os.path.join(default_test_dir(), "storage")
+    except Exception:
+        return os.path.join(os.path.dirname(HERE), "storage")
+
+
+def _pkg_from_case_path(path):
+    """从用例路径反推被测包名：cases/<包名>/x.py → <包名>。
+
+    目录名不像包名（不含 '.'）时返回 None —— 只影响"去哪找语料"，
+    猜错最多导致 check_facts 不校验，不会误判。
+    """
+    d = os.path.basename(os.path.dirname(os.path.abspath(path or "")))
+    return d if "." in d else None
+
+
+def _dir_has_entries(d):
+    try:
+        return os.path.isdir(d) and next(os.scandir(d), None) is not None
+    except OSError:
+        return False
+
+
+def _case_has_corpus(pkg, case_stem):
+    """该用例是否有"当次语料"（check_facts 的输入）。
+
+    判据刻意是 **per-case**，而不是"storage 目录是否存在"（P0a 设计点）：
+    probes 被清空后 storage/probes/ 目录可能还在、里面却是别的页面；traces 是
+    采集会话档案（按用例名分目录）。任一有内容才算"可校验"。
+    """
+    storage = _storage_dir()
+    candidates = []
+    if pkg:
+        candidates.append(os.path.join(storage, "probes", pkg))
+    candidates.append(os.path.join(storage, "traces", case_stem))
+    return any(_dir_has_entries(d) for d in candidates)
+
+
+def run_gates(path, pkg=None):
+    """执行前静态守门。返回 True=放行，False=拒跑（原因已打印）。"""
+    _reset_gate_stats()
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if stem.startswith("_"):
+        print(f"[守门] {stem} 是辅助脚本（_ 前缀、无 USER_INPUT）→ 跳过静态守门")
+        return True
+    if os.environ.get("DSH_SKIP_GATES") == "1":
+        print("[守门] DSH_SKIP_GATES=1 → 跳过静态守门（调试用）")
+        return True
+
+    evals_dir = os.path.join(os.path.dirname(HERE), "evals")
+    if os.path.isdir(evals_dir) and evals_dir not in sys.path:
+        sys.path.insert(0, evals_dir)
+
+    # ① lint_case：ERROR 拒跑，HINT 只提示
+    try:
+        import lint_case
+        errors, hints = lint_case.lint_file(path)
+        quiet = getattr(lint_case, "_QUIET_HINT_RULES", frozenset())
+    except Exception as e:
+        print(f"⚠️ [守门] lint 不可用（跳过）: {e}")
+        return True
+
+    if errors:
+        LAST_GATE_STATS["lint_errors"] = len(errors)
+        print(f"❌ [守门] lint 发现 {len(errors)} 处违规 → 拒跑（先改用例再跑）:")
+        for line, rule, msg in errors:
+            print(f"     {stem}.py:{line} [{rule}] {msg}")
+        print("     确需原样执行（仅调试）：设 DSH_SKIP_GATES=1")
+        return False
+    shown = [h for h in hints if h[1] not in quiet]
+    folded = f"，另有 {len(hints) - len(shown)} 条已折叠" if len(shown) != len(hints) else ""
+    print(f"[守门] lint 通过（{len(hints)} 条提示{folded}）")
+    for line, rule, msg in shown:
+        print(f"     💡 {stem}.py:{line} [{rule}] {msg}")
+
+    # ② check_facts：只告警（无当次语料时明确打"未校验"，不判违规）
+    if not _case_has_corpus(pkg, stem):
+        print("[守门] check_facts 未校验 —— 该用例无当次语料"
+              "（probes 30 分钟即清 / 无采集档案）")
+        return True
+    try:
+        import check_facts
+        storage = _storage_dir()
+        suspects, checked = check_facts.check_facts_file(
+            path, [os.path.join(storage, "probes"),
+                   os.path.join(storage, "traces")])
+    except Exception as e:
+        print(f"⚠️ [守门] check_facts 不可用（跳过）: {e}")
+        return True
+    if suspects:
+        print(f"⚠️ [守门] check_facts 疑似编造文案 {len(suspects)} 处"
+              f"（共检查 {checked} 个断言词）—— 仅告警，不拒跑：")
+        for line, word in suspects:
+            print(f"     {stem}.py:{line} {word!r}（语料中无出处 → 回探索补采）")
+    else:
+        print(f"[守门] check_facts 通过（{checked} 个断言词均有出处）")
+    LAST_GATE_STATS["check_facts_suspects"] = len(suspects)
+    LAST_GATE_STATS["checked_words"] = checked
+    return True
+
+
+def _knowledge_dirs():
+    """知识卡目录（工作区优先、skill 包兜底）——与 cases/ 的搜索顺序同构。"""
+    dirs = []
+    try:
+        from db import default_test_dir
+        dirs.append(os.path.join(default_test_dir(), "knowledge"))
+    except Exception:
+        pass
+    for d in CASE_DIRS:
+        dirs.append(os.path.join(os.path.dirname(d), "knowledge"))
+    return [d for d in dirs if os.path.isdir(d)]
+
+
+def _single_device_serial():
+    """唯一已授权设备的 serial；零台/多台 → None（**宁可不查也不猜**）。
+
+    与 test_framework._resolve_serial 同一口径：多台设备时"猜一台"会让版本
+    门禁报出另一台设备的版本，比不报更糟。
+    """
+    try:
+        r = subprocess.run(["adb", "devices"], capture_output=True, text=True,
+                           timeout=10, encoding="utf-8", errors="replace")
+    except Exception as e:
+        # ⚠️ 不许静默：这里原本是 `except Exception: return None`，把
+        # `NameError: subprocess 未导入` 吞成了"没有唯一设备"→ 版本门禁**一次都没
+        # 采集过**版本号（DB 里 app_version_* 恒 NULL），全程无任何报错。
+        # 2026-09-16 真机实测踩到；同类"缺导入 + 宽 except"是静默失效的典型形态。
+        print(f"⚠️ [版本门禁] 查设备失败，跳过版本采集: {e}")
+        return None
+    devs = []
+    for ln in (r.stdout or "").splitlines():
+        parts = ln.split()
+        if len(parts) >= 2 and parts[1] == "device":
+            devs.append(parts[0])
+    return devs[0] if len(devs) == 1 else None
+
+
+def collect_app_version(serial, pkg):
+    """取被测 App 的 (versionName, versionCode)；任何失败 → (None, None)。
+
+    门禁绝不能因为取不到版本而阻断用例执行。
+    """
+    if not serial or not pkg:
+        return None, None
+    try:
+        import version_gate
+        r = subprocess.run(
+            ["adb", "-s", serial, "shell", "dumpsys", "package", pkg],
+            capture_output=True, text=True, timeout=20,
+            encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            print(f"⚠️ [版本门禁] dumpsys package 返回 {r.returncode}，版本未采集")
+            return None, None
+        return version_gate.parse_version(r.stdout)
+    except Exception as e:
+        # 同上：不静默（缺导入/解析异常都要看得见）
+        print(f"⚠️ [版本门禁] 版本采集失败（不阻断执行）: {e}")
+        return None, None
+
+
+def _dump_static_metrics(path, device=None):
+    """收集静态指标（含版本门禁的信号 1）并写入环境变量。
+
+    **隐藏前提**（§4.1）：run_case 启动时既无设备 serial、也未定被测包名 ——
+    包名从用例路径反推（`_pkg_from_case_path`），serial 只认显式 `--device`
+    或"唯一已授权设备"。取不到就只落 None，不阻断执行。
+    """
+    try:
+        import run_metrics as _rm
+        import version_gate as _vg
+    except Exception:
+        return
+    metrics = _rm.collect_static(path, LAST_GATE_STATS)
+    pkg = _pkg_from_case_path(path)
+    vname = vcode = card_v = None
+    if pkg:
+        serial = device or _single_device_serial()
+        vname, vcode = collect_app_version(serial, pkg)
+        card_v = _vg.read_card_version(_knowledge_dirs(), pkg)
+        if vname or vcode:
+            print(f"[版本门禁] {pkg}: versionName={vname} versionCode={vcode}")
+            # ⚠️ 用 version_gate 的**同一个**判断函数：这里原本自己写了一份精确
+            # 比较，与 finish() 那份漂移（2026-09-16 实测：归一化只改了 finish，
+            # 启动时照样报假 WARN）。同一逻辑只许有一份实现。
+            _line = _vg.card_mismatch_line(card_v, vname)
+            if _line:
+                print(f"⚠️ [版本门禁] {_line} —— 只告警，不废缓存")
+    # 双采（§4.1）：versionName 与现存卡比对、versionCode 落盘存档。
+    # P2 卡头部改造完成后再切换为 versionCode 单一比对。
+    metrics["app_version_name"] = vname
+    metrics["app_version_code"] = vcode
+    # card_version **不是** case_metrics 的列，只是传给 TestCase 的载体
+    # （报告「本次与历史的差异」节要用它；落库时被 sanitize_extra 自动丢弃）。
+    metrics["card_version"] = card_v
+    _rm.dump_static(metrics)
 
 
 def _setup_logging():
@@ -250,7 +504,19 @@ def _setup_logging():
 
 
 def main():
-    name, device = _parse_args(sys.argv)
+    # 控制台编码兜底（2026-09-16 实测踩到）：Windows 默认控制台是 GBK
+    # （cp936），无法编码 emoji（❌ U+274C / 💡 U+1F4A1 等）→ `print` 直接抛
+    # UnicodeEncodeError **中断用例执行**（实测：守门打印 ❌ 时崩，退出码 1，
+    # 既没拒跑也没跑用例）。errors="replace" 只把不可编码字符降级成 "?"，
+    # 不改变中文本身的编码行为，也不会再中断。
+    # 与 evals/lint_case.py main() 的同类处理一致；不设 encoding 是为了不把
+    # GBK 控制台的中文输出变成乱码。
+    try:
+        sys.stdout.reconfigure(errors="replace")
+        sys.stderr.reconfigure(errors="replace")
+    except Exception:
+        pass
+    name, device, stop_after = _parse_args(sys.argv)
     # 结构化日志：每次执行落 storage/logs/run_<ts>.log
     try:
         _setup_logging()
@@ -259,6 +525,12 @@ def main():
     # 套件 runner 传 --device SERIAL 时，注入环境变量供 TestCase 读取
     if device:
         os.environ["DSH_DEVICE_ID"] = device
+    # --stop-after N：局部执行（edit-run 调试循环）。注入环境变量供 TestCase
+    # 在 step() 处判断（§八 P1a：退出码 0、不入库、不计入 flaky）。
+    if stop_after is not None:
+        os.environ["DSH_STOP_AFTER"] = str(stop_after)
+        print(f"[局部执行] --stop-after {stop_after}：只跑前 {stop_after} 步"
+              "（退出码 0、不入库）")
     try:
         warn_if_framework_drift()
     except Exception:
@@ -302,15 +574,26 @@ def main():
         # 用 _looks_like_formal_case 给一个显眼提醒（不阻断：探查脚本本就该无）。
         _warn_missing_user_input(path)
 
+    # ── P0a 执行时守门 ────────────────────────────────────────────────
+    # 位置刻意在探查缓存维护**之前**：check_facts 的语料就是 probes/traces，
+    # 先跑维护会把"本次本可校验"的语料删掉，让守门永远报"未校验"。
+    if not run_gates(path, _pkg_from_case_path(path)):
+        sys.exit(GATE_EXIT_CODE)
+    # RunMetrics 静态指标（脚本 hash / sleep 静态和 / 守门计数 / 版本双采）→
+    # 环境变量，由 TestCase.finish() 合并落库（§7.1）。失败不阻断执行。
+    _dump_static_metrics(path, device)
+
     # 探查缓存维护（2026-09-10 讨论定稿）：探查产物用完即弃——
     # 超过 30 分钟未访问的 storage/probes/ 目录由**代码**自动删除，
     # 不靠人/AI 记得清理（"一个自觉弥补另一个自觉"）。
     # 每次跑用例都做一次，等于把清理挂在最频繁的入口上。
+    # 阈值可由环境变量 DSH_PROBES_MAXIDLE_MIN 覆盖（0=关闭清理，见 cleanup_probes）；
+    # 调试期放宽它可保住同一批 probes 供离线预检（inventory.py verify）复用。
     try:
         from test_framework import TestCase as _TC
-        _removed, _kept = _TC.cleanup_probes(max_idle_min=30)
+        _removed, _kept = _TC.cleanup_probes()
         if _removed:
-            print(f"[探查缓存] 已清理 {_removed} 份超时（>30 分钟未访问），保留 {_kept} 份")
+            print(f"[探查缓存] 已清理 {_removed} 份超时未访问，保留 {_kept} 份")
         _stale = _TC.list_probes()
         if _stale:
             print(f"[探查缓存] 现有 {len(_stale)} 份（还在 30 分钟窗口内，本次不删；"
@@ -325,6 +608,7 @@ def main():
     spec = importlib.util.spec_from_file_location("testcase", path)
     mod = importlib.util.module_from_spec(spec)
     import traceback
+    from test_framework import PartialRun      # 局部执行（--stop-after）
     try:
         spec.loader.exec_module(mod)
         if not hasattr(mod, "run"):
@@ -333,6 +617,18 @@ def main():
         report = mod.run()
     except KeyboardInterrupt:
         raise
+    except PartialRun as e:
+        # --stop-after：主动收尾，**不是失败**。刻意不走下面那条异常分支：
+        # 那里会标 _fatal_error（结论被压成 ERROR）、退出码 3 —— 与"局部执行"
+        # 的语义完全相反。这里也不记 FAIL（否则"跑一半"污染缺陷库）。
+        print(f"\n⏸️  {e} → 局部执行完成（退出码 0，不入库）")
+        tc = _last_case()
+        if tc is not None:
+            try:
+                tc.finish()
+            except Exception:
+                pass
+        sys.exit(0)
     except Exception as e:
         # 脚本/框架/设备异常：留完整堆栈，尽量生成已有证据的报告。
         # ⚠️ 必须先标记 _fatal_error 再 finish：用例没跑完，断言统计不可信，
@@ -356,8 +652,14 @@ def main():
             except Exception:
                 pass
         if is_abort:
-            code = 1
-            tail = "必需操作失败"
+            # 结论由 final_status 映射：CaseBlocked 记的是 BLOCKED → 2，普通
+            # CaseAbort 记的是 FAIL → 1。**不再硬编码 1** —— 硬编码会把 BLOCKED
+            # 写成 FAIL 的退出码，让"前置条件缺失"和"App 真缺陷"在 CI 侧无法区分
+            # （§2.2 点名的退出码陷阱）。
+            code = exit_code_for(getattr(tc, "final_status", None))
+            if code == 3:      # 拿不到结论 → 退回旧行为（1），不假装知道
+                code = 1
+            tail = "必需操作失败（前置条件不满足则记 BLOCKED）"
         elif already_finished:
             code = exit_code_for(getattr(tc, "final_status", None))
             tail = f"收尾异常（用例已完成，结论 {getattr(tc, 'final_status', None)}）"

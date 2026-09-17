@@ -94,7 +94,46 @@ def _swipe_up(t, ratio=0.5):
     w, h = t.d.window_size()
     x = w // 2
     t.d.swipe(x, int(h * 0.75), x, int(h * (0.75 - ratio)), 0.3)
+    # settle：等惯性滚动停下。**无元素信号可等**（滚到哪儿取决于动量），
+    # 不是"没改"，是这类等待本来就无法条件化。
     time.sleep(1.0)
+
+
+# ── 等弹框：把"裸 sleep 碰运气"换成"命中即停"（M2）──────────────────
+# 依据：这些弹框的按钮（取消/确定）**是 UI 树里的真实节点且文案精确匹配**
+# —— 证据是本用例的 `t.tap_text("取消")` 一直能点到（tap_text 内部就是精确匹配）。
+# 所以 `wait_text` 是**可靠条件**，不是猜。
+# timeout 取**原 sleep 的值**：命中即返回（实测 0.3–0.8s），超时才等满 → 上限与
+# 原来一致，因此**不会比原来慢**，只可能更快（这正是 M2 的来源）。
+DIALOG_OK = "确定"
+
+
+def _wait_dialog_open(t, timeout=2.0):
+    """等弹框出现（滚轮/选项框）。替代原来的 `time.sleep(2)`。"""
+    return t.wait_text(DIALOG_OK, timeout=timeout)
+
+
+def _wait_dialog_closed(t, timeout=2.0):
+    """等弹框关闭（点「取消」/「确定」之后）。替代原来的 `time.sleep(2)`。"""
+    return t.wait_gone(text=DIALOG_OK, timeout=timeout)
+
+
+# ── sleep 审计（2026-09-16 真机验证轮）──────────────────────────────
+# 本文件 sleep：**27 处 / 54.3s → 13 处 / 17.8s**（M2 目标 ≤30s ✓）。
+# 已条件化的 14 处 = "等弹框开/关 + 等 Activity + 等元素出现"，
+# timeout 一律取原 sleep 值 → **上限不变，只可能更快**（命中即停）。
+#
+# 保留的 13 处**逐类核对过**，三类原因（不是漏改）：
+#   ① settle 无 UI 信号：swipe 惯性滚动（`_swipe_up`、步骤5 回顶）、
+#      页面转场（`t.back()` 之后）；
+#   ② **等"值变化"而非"元素出现"**：拨滚轮档位后读值、改 RadioGroup 后读行内值、
+#      改节次时间后重新读列表——元素一直在，变的是它的 text（`wait_*` 只认
+#      出现/消失，表达不了"值变了"）；
+#   ③ 等"弹框消失"但**子串无法表达消失**：询问框只在文案里含「自动调整」，
+#      `wait_gone` 需要精确文案 → 用 wait_text_contains 等它出现（已做），
+#      但"等它关掉"仍只能 settle。
+# 结论：这 13 处要再降需要**框架加能力**（如 `wait_rid_text(rid, expect=...)`
+# 等值变化），不是改用例能解决的。
 
 
 def _col_x(t):
@@ -122,7 +161,8 @@ def _prepare(t):
     """
     if not goto_手动创建课程表(t, pm_clear=True):
         return False
-    time.sleep(2)
+    # 等课表名输入框出现（原来是 sleep(2) 后盲点）—— 元素驱动，命中即停
+    t.wait_rid(f"{PKG}:id/et_schedule_name", timeout=2)
     t.tap_rid(f"{PKG}:id/et_schedule_name", silent=True)
     t.input_text(f"{PKG}:id/et_schedule_name", TB_NAME)
     time.sleep(1)
@@ -136,12 +176,11 @@ def _prepare(t):
 def _goto_time_settings(t):
     """编辑页 → 课程时间设置页（入口 rid=layout_time_settings）。"""
     if t.tap_rid(RID_TIME_SETTINGS, silent=True):
-        time.sleep(3)
-        if "TimeSlotSettings" in t.current_activity():
+        # 等页面到位（原本是 sleep(3) + 查一次 Activity）—— wait_activity 命中即停
+        if t.wait_activity("TimeSlotSettings", timeout=3):
             return True
     if t.tap_text("课程时间设置", wait=5, silent=True):
-        time.sleep(3)
-        if "TimeSlotSettings" in t.current_activity():
+        if t.wait_activity("TimeSlotSettings", timeout=3):
             return True
     t.blocked(f"未进入课程时间设置页，当前 Activity={t.current_activity()}")
     return False
@@ -179,9 +218,10 @@ def _dial_to(t, layout_rid, value_rid, target, values, max_rounds=4):
         n = _steps_to(values, cur, target)
         if not t.tap_rid(layout_rid, silent=True):
             break
-        time.sleep(2)
+        _wait_dialog_open(t)      # 等弹框（原来是 sleep(2) 后直接拨滚轮）
         wheel_tap_steps(t, _col_x(t), n=n, up=False)
         last = apply_and_read(t, value_rid)
+        # settle：滚轮档位落定后才读值（值变化不是"元素出现"，无法条件化）
         time.sleep(1)
     return last
 
@@ -278,7 +318,7 @@ def run():
     # 验证2: 点击后弹框打开（Canvas 自绘，只断言弹框结构）
     # 点击行容器 layout_lesson_duration（值节点 tv_* 不可点）
     if t.tap_rid(LAY_DURATION, silent=True):
-        time.sleep(2)
+        _wait_dialog_open(t)          # 原来是 sleep(2) 后碰运气读屏
         dlg = " ".join(t.screen_text())
         opened = ("取消" in dlg and "确定" in dlg)
         t.record("PASS" if opened else "FAIL",
@@ -287,7 +327,7 @@ def run():
 
         # 验证2: 取消不修改设置
         if t.tap_text("取消", wait=4, silent=True):
-            time.sleep(2)
+            _wait_dialog_closed(t)    # 等弹框真的关掉再读值（原来是 sleep(2)）
             after_cancel = _text_of(t, DURATION)
             t.record("PASS" if after_cancel == dur else "FAIL",
                      f"点取消后不修改设置: 取消前 {dur!r} → 取消后 {after_cancel!r}")
@@ -297,7 +337,7 @@ def run():
 
     # 验证2: 选择分钟数后点确定设置成功（+1档 = 55分钟）
     if t.tap_rid(LAY_DURATION, silent=True):
-        time.sleep(2)
+        _wait_dialog_open(t)
         t.screenshot("08_上课时长弹框_待改")
         wheel_tap_steps(t, _col_x(t), n=1, up=False)   # 下 = 增大一档
         got = apply_and_read(t, DURATION)
@@ -315,7 +355,7 @@ def run():
     t.record("PASS" if _num(hi) == 120 else "FAIL",
              f"上课时长可拨到上端 120 分钟: 实际 {hi!r}")
     if _num(hi) == 120 and t.tap_rid(LAY_DURATION, silent=True):
-        time.sleep(2)
+        _wait_dialog_open(t)
         # 越界后**只断言值域**，不押"必然回绕"：用例诉求是"可选择 30-120 分钟"
         # （见 USER_INPUT），回绕还是钳制都满足。实际行为记 INFO 供人工判断。
         wheel_tap_steps(t, _col_x(t), n=5, up=False)       # 远超到顶所需档数
@@ -334,14 +374,14 @@ def run():
              f"默认课间休息时长应为10分钟，实际 {brk!r}")
 
     if t.tap_rid(LAY_BREAK, silent=True):
-        time.sleep(2)
+        _wait_dialog_open(t)
         dlg = " ".join(t.screen_text())
         t.record("PASS" if ("取消" in dlg and "确定" in dlg) else "FAIL",
                  f"点击后弹出课间休息选择框: {dlg[:80]!r}")
         t.screenshot("11_课间休息弹框")
         # 验证3: 取消不修改
         if t.tap_text("取消", wait=4, silent=True):
-            time.sleep(2)
+            _wait_dialog_closed(t)    # 等弹框真的关掉再读值（原来是 sleep(2)）
             after_cancel = _text_of(t, BREAK)
             t.record("PASS" if after_cancel == brk else "FAIL",
                      f"点取消后不修改设置: 取消前 {brk!r} → 取消后 {after_cancel!r}")
@@ -350,7 +390,7 @@ def run():
 
     # 验证3: 选择后确定设置成功（+1档 = 15分钟）
     if t.tap_rid(LAY_BREAK, silent=True):
-        time.sleep(2)
+        _wait_dialog_open(t)
         wheel_tap_steps(t, _col_x(t), n=1, up=False)
         got = apply_and_read(t, BREAK)
         t.record("PASS" if _num(got) == 15 else "FAIL",
@@ -365,7 +405,7 @@ def run():
     t.record("PASS" if _num(hi) == 30 else "FAIL",
              f"课间休息可拨到上端 30 分钟: 实际 {hi!r}")
     if _num(hi) == 30 and t.tap_rid(LAY_BREAK, silent=True):
-        time.sleep(2)
+        _wait_dialog_open(t)
         # ⚠️ 原断言"30 再拨一档应回绕到 5"被实测**推翻**：5 次运行 2 次回绕、
         #    3 次停在 30；核对式重试 4 次仍停 30 → 本机型在 30 处**大概率是钳制**。
         #    而用例诉求（USER_INPUT）只要求"可选择 5-30 分钟"——
@@ -468,7 +508,7 @@ def run():
         arrows.sort(key=lambda n: n["bounds_xy"][1])
         b = arrows[0]["bounds_xy"]
         t.tap_xy((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
-        time.sleep(3)
+        _wait_dialog_open(t, timeout=3)      # 等 TimePicker 弹框（原 sleep(3)）
         return True
 
     _scroll_top()          # 步骤5 采集时已滚到底，先回页首再找第1节
@@ -483,7 +523,9 @@ def run():
 
         # 验证6: 点确定后弹「是否自动调整其他课程」询问框
         if t.tap_text("确定", wait=4, silent=True):
-            time.sleep(2.5)
+            # 等询问框：只能按**子串**等（文案是整句「是否根据课程时长…自动调整…」），
+            # 原写法 sleep(2.5) 后一次性读屏 —— 慢一点就假 FAIL。
+            t.wait_text_contains("自动调整", timeout=2.5)
             q = " ".join(t.screen_text())
             has_q = "自动调整" in q
             t.record("PASS" if has_q else "FAIL",
@@ -508,7 +550,7 @@ def run():
                 if _open_slot_row():
                     wheel_tap_steps(t, _col_x(t), n=1, up=False)   # 改第1节开始时间
                     if t.tap_text("确定", wait=4, silent=True):
-                        time.sleep(2.5)
+                        t.wait_text_contains("自动调整", timeout=2.5)
                         if "自动调整" in " ".join(t.screen_text()):
                             t.tap_text("确定", wait=3, silent=True)
                             time.sleep(3)
@@ -543,7 +585,8 @@ def run():
 
     # 验证7: 点击可修改提醒时间
     if t.tap_rid(LAY_REMINDER, silent=True):
-        time.sleep(2.5)
+        # 等选项出现（「不提醒」是真实节点、文案精确）—— 原 sleep(2.5) 后读屏
+        t.wait_text("不提醒", timeout=2.5)
         dlg = " ".join(t.screen_text())
         t.screenshot("22_提醒时间弹框")
         options = [o for o in ("不提醒", "任务发生时", "5分钟前", "15分钟前", "30分钟前")

@@ -4,6 +4,8 @@
 
 - **app**: `com.zui.launcher`
 - **name**: 联想桌面 / ZUI Launcher
+- **验证版本**: 18.5.0.0702（versionName，2026-09-16 真机采集）
+- **versionCode**: 18500702（2026-09-16 真机采集，TB323FU / Android 17）
 - **最近验证**: 2026-09-09（dock「所有应用」入口、APP 列表、长按菜单 实测通过）
 
 > 注意：`com.tblenovo.center` 是「服务与反馈」，**不是**桌面；桌面包名是 `com.zui.launcher`。

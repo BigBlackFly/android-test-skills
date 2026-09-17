@@ -27,8 +27,10 @@ sys.path.insert(0, os.path.join(_ROOT, "framework"))
 os.environ.setdefault("DSH_WORKSPACE_DIR",
                       os.path.join(tempfile.gettempdir(), "dsh-unittest-ws"))
 
-import db        # noqa: E402
-import run_case  # noqa: E402
+import db          # noqa: E402
+import run_case    # noqa: E402
+import run_metrics  # noqa: E402
+import version_gate  # noqa: E402
 import states    # noqa: E402
 import vision    # noqa: E402
 import webui     # noqa: E402
@@ -38,6 +40,7 @@ _SCRIPTS = os.path.join(_ROOT, "scripts")
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 import check_context_budget as budget_mod  # noqa: E402
+import knowledge_index as ki_mod  # noqa: E402
 
 # framework/smoke.py 加入 sys.path 以便测试 _check_adb
 import smoke  # noqa: E402
@@ -46,6 +49,7 @@ try:
     import test_framework as tf
 except ImportError:  # 系统 Python 无 uiautomator2 时跳过相关用例
     tf = None
+_tf = tf             # 别名：P1b 用例沿用 _tf 写法（与 test_run_suite 一致）
 
 
 # ── states.py：场景卡解析与自动注册 ──────────────────────────────────
@@ -2014,6 +2018,1188 @@ class TestDeviceRotation(unittest.TestCase):
         self.assertIsNone(t.device_rotation())
         t.adb_shell = lambda *a, **k: "no rotation info here"
         self.assertIsNone(t.device_rotation())
+
+
+# ── P0b-①：探查缓存清理阈值可配（DSH_PROBES_MAXIDLE_MIN，0=关闭）──────
+@unittest.skipIf(tf is None, "需要 uiautomator2（用工作区 venv 跑本测试）")
+class TestCleanupProbesTtl(unittest.TestCase):
+    """cleanup_probes 的阈值来源与 0 语义。
+
+    背景（plan/mechanism-over-prose-plan.md §八 P0b-①）：编辑用例时常要复用同一批
+    probes 做离线预检（inventory.py verify），而 30 分钟会在写作途中把缓存清掉，
+    逼着回真机重探 —— 这是"改一点要整跑"的直接成因之一。阈值改为可由
+    DSH_PROBES_MAXIDLE_MIN 覆盖，与 traces 侧 DSH_TRACE_MAXIDLE_MIN 同一模式
+    （trace_recorder.py:57-59）。
+
+    本类最重要的一条是 test_zero_disables_and_keeps_files：旧实现把 0 直接当阈值
+    （cutoff = now → **删光所有缓存**），与 traces 侧"设 0 可关闭"语义相反。
+    锁住正确语义，防脚枪复发。
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="dsh-probes-")
+        self.addCleanup(tmp.cleanup)
+        self._dir = tmp.name
+        self._old_probe_dir = tf.PROBE_DIR
+        tf.PROBE_DIR = self._dir
+        self.addCleanup(self._restore)
+        os.environ.pop("DSH_PROBES_MAXIDLE_MIN", None)
+
+    def _restore(self):
+        tf.PROBE_DIR = self._old_probe_dir
+        os.environ.pop("DSH_PROBES_MAXIDLE_MIN", None)
+
+    def _mk_probe(self, label, idle_min):
+        """造一份 idle_min 分钟前访问过的缓存；返回其目录。"""
+        d = os.path.join(self._dir, "com.example.app", label)
+        os.makedirs(d, exist_ok=True)
+        stamp = time.time() - idle_min * 60
+        with open(os.path.join(d, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump({"label": label, "package": "com.example.app",
+                       "accessed": time.strftime("%Y-%m-%dT%H:%M:%S",
+                                                 time.localtime(stamp))}, f)
+        return d
+
+    def test_zero_disables_and_keeps_files(self):
+        """0 = 关闭清理（不是"删光"）——旧实现反语义脚枪的回归保护。"""
+        d = self._mk_probe("超时很久的页", 999)
+        self.assertEqual(tf.TestCase.cleanup_probes(max_idle_min=0,
+                                                   verbose=False), (0, 0))
+        self.assertTrue(os.path.isdir(d))
+
+    def test_env_zero_disables(self):
+        """环境变量 0 同样 = 关闭（与 traces 侧同语义）。"""
+        d = self._mk_probe("超时很久的页", 999)
+        os.environ["DSH_PROBES_MAXIDLE_MIN"] = "0"
+        self.assertEqual(tf.TestCase.cleanup_probes(verbose=False), (0, 0))
+        self.assertTrue(os.path.isdir(d))
+
+    def test_env_is_read(self):
+        """设了环境变量就按它清理（1 分钟 → 超时的被删）。"""
+        d = self._mk_probe("超时很久的页", 999)
+        os.environ["DSH_PROBES_MAXIDLE_MIN"] = "1"
+        removed, kept = tf.TestCase.cleanup_probes(verbose=False)
+        self.assertEqual((removed, kept), (1, 0))
+        self.assertFalse(os.path.isdir(d))
+
+    def test_explicit_arg_beats_env(self):
+        """显式参数优先于环境变量（env 关闭、显式 60 → 仍清理）。"""
+        d = self._mk_probe("超时很久的页", 999)
+        os.environ["DSH_PROBES_MAXIDLE_MIN"] = "0"
+        removed, _ = tf.TestCase.cleanup_probes(max_idle_min=60, verbose=False)
+        self.assertEqual(removed, 1)
+        self.assertFalse(os.path.isdir(d))
+
+    def test_default_is_still_30(self):
+        """不设环境变量 → 默认仍是 30 分钟，行为与历史一致。"""
+        stale = self._mk_probe("30 分钟外的页", 999)
+        fresh = self._mk_probe("1 分钟前的页", 1)
+        removed, kept = tf.TestCase.cleanup_probes(verbose=False)
+        self.assertEqual((removed, kept), (1, 1))
+        self.assertFalse(os.path.isdir(stale))
+        self.assertTrue(os.path.isdir(fresh))
+
+    def test_invalid_env_falls_back_to_30(self):
+        """环境变量非法值 → 回落 30（不静默跳过清理，也不抛）。"""
+        d = self._mk_probe("超时很久的页", 999)
+        os.environ["DSH_PROBES_MAXIDLE_MIN"] = "三十分钟"
+        removed, _ = tf.TestCase.cleanup_probes(verbose=False)
+        self.assertEqual(removed, 1)
+        self.assertFalse(os.path.isdir(d))
+
+    def test_missing_probe_dir_is_noop(self):
+        tf.PROBE_DIR = os.path.join(self._dir, "不存在的目录")
+        self.assertEqual(tf.TestCase.cleanup_probes(verbose=False), (0, 0))
+
+
+# ── P0a：run_case 执行前静态守门（lint 拒跑 / check_facts 仅告警）────────
+@unittest.skipIf(tf is None, "需要 uiautomator2（用工作区 venv 跑本测试）")
+class TestRunGates(unittest.TestCase):
+    """守门级别定义：lint ERROR → 拒跑；check_facts → 只告警；辅助脚本跳过。
+
+    背景（plan/mechanism-over-prose-plan.md §八 P0a）：run_case 此前**零处**
+    调用 lint / check_facts（静态守门形同虚设，只在 CI 里跑）。接入后必须保证：
+    ① 正式用例的 lint ERROR 拦得住；
+    ② 辅助脚本（`_` 前缀）不被规则 1（缺 USER_INPUT）误拦——它本就无该常量；
+    ③ check_facts 不因"无语料"把干净用例判违规（probes 30 分钟即清是常态）。
+    """
+
+    _CLEAN = 'USER_INPUT = "跑一下"\n\n\ndef run():\n    pass\n'
+    _BAD = ('USER_INPUT = "跑一下"\n\n\ndef run():\n    t = TestCase("x")\n'
+            '    t.tap_xy(100, 200)\n')
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="dsh-gates-")
+        self.addCleanup(tmp.cleanup)
+        self._tmp = tmp.name
+        self._old_skip = os.environ.pop("DSH_SKIP_GATES", None)
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self):
+        os.environ.pop("DSH_SKIP_GATES", None)
+        if self._old_skip is not None:
+            os.environ["DSH_SKIP_GATES"] = self._old_skip
+
+    def _mk_case(self, name, body):
+        p = os.path.join(self._tmp, name)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(body)
+        return p
+
+    def _storage(self):
+        return os.path.join(self._tmp, "storage")
+
+    def test_lint_error_blocks(self):
+        """lint ERROR（裸坐标）→ 拒跑。"""
+        p = self._mk_case("171.py", self._BAD)
+        self.assertFalse(run_case.run_gates(p))
+
+    def test_clean_case_passes(self):
+        p = self._mk_case("172.py", self._CLEAN)
+        self.assertTrue(run_case.run_gates(p))
+
+    def test_aux_script_skipped(self):
+        """辅助脚本（`_` 前缀）整段跳过：它本就无 USER_INPUT，规则 1 不适用。"""
+        p = self._mk_case("_explore_172.py", "def run():\n    pass\n")
+        self.assertTrue(run_case.run_gates(p))
+
+    def test_skip_gates_env_escapes(self):
+        """DSH_SKIP_GATES=1 → 即使有 ERROR 也放行（调试逃生口）。"""
+        os.environ["DSH_SKIP_GATES"] = "1"
+        p = self._mk_case("173.py", self._BAD)
+        self.assertTrue(run_case.run_gates(p))
+
+    def test_pkg_from_case_path(self):
+        self.assertEqual(
+            run_case._pkg_from_case_path("/x/cases/com.a.b/172.py"), "com.a.b")
+        # 目录名不像包名 → None（守门据此不去猜语料位置）
+        self.assertIsNone(run_case._pkg_from_case_path("/x/cases/随便/172.py"))
+
+    def test_missing_corpus_is_not_a_violation(self):
+        """无语料 → 不判违规（放行）—— check_facts 的正确语义。"""
+        p = self._mk_case("174.py", self._CLEAN)
+        with mock.patch.object(run_case, "_storage_dir",
+                               return_value=self._storage()):
+            self.assertFalse(run_case._case_has_corpus("com.a.b", "174"))
+            self.assertTrue(run_case.run_gates(p, "com.a.b"))
+
+    def test_empty_corpus_dir_is_not_corpus(self):
+        """**per-case 判据**：目录存在但为空 ≠ 有语料。"""
+        os.makedirs(os.path.join(self._storage(), "probes", "com.a.b"))
+        with mock.patch.object(run_case, "_storage_dir",
+                               return_value=self._storage()):
+            self.assertFalse(run_case._case_has_corpus("com.a.b", "176"))
+
+    def test_corpus_present_goes_through_check_facts(self):
+        """有当次语料 → 走 check_facts 分支（空语料无害，仍放行）。"""
+        d = os.path.join(self._storage(), "probes", "com.a.b", "首页")
+        os.makedirs(d)
+        with open(os.path.join(d, "dump.xml"), "w", encoding="utf-8") as f:
+            f.write("<hierarchy/>")
+        p = self._mk_case("175.py", self._CLEAN)
+        with mock.patch.object(run_case, "_storage_dir",
+                               return_value=self._storage()):
+            self.assertTrue(run_case._case_has_corpus("com.a.b", "175"))
+            self.assertTrue(run_case.run_gates(p, "com.a.b"))
+
+
+# ── P0a：RunMetrics 采集器与落库（§7.1）─────────────────────────────
+class TestRunMetrics(unittest.TestCase):
+    """脚本 hash / sleep 静态求和 / rid 集合 hash 与差集 / 增量列落库。
+
+    这是"变更归因"的地基（§10.2 决策表第一行就是脚本 hash）：没有它，
+    "用例行为变了"只能怪到 App/配置头上，而实际多半是自己改脚本改出来的。
+    """
+
+    _CASE = '''
+USER_INPUT = "x"
+import time
+
+
+def run():
+    t = TestCase("x")
+    time.sleep(1.5)
+    time.sleep(2)
+    w = 3
+    time.sleep(w)          # 动态值：静态口径不计入（所以是"下界"）
+    time.sleep(True)       # bool 不算数值（bool 是 int 子类）
+'''
+
+    def _mk(self, body):
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False,
+                                         encoding="utf-8") as f:
+            f.write(body)
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    # ── sleep 静态求和（§7.2 M2 的分母口径）─────────────────────────
+    def test_sleep_static_only_literals(self):
+        """只累计数字字面量：1.5 + 2 = 3.5。"""
+        self.assertEqual(
+            run_metrics.sleep_static_seconds(self._mk(self._CASE)), 3.5)
+
+    def test_sleep_static_no_sleep_is_zero(self):
+        self.assertEqual(
+            run_metrics.sleep_static_seconds(self._mk("x = 1\n")), 0.0)
+
+    def test_sleep_static_unparsable_is_none(self):
+        """解析失败 → None（**不返回 0**：0 会被当成"真的一点没等"）。"""
+        self.assertIsNone(
+            run_metrics.sleep_static_seconds(self._mk("def (: pass\n")))
+
+    # ── 脚本 hash（变更归因第一排除项）──────────────────────────────
+    def test_src_hash_changes_with_content(self):
+        a = run_metrics.src_hash(self._mk("x = 1\n"))
+        b = run_metrics.src_hash(self._mk("x = 2\n"))
+        self.assertIsNotNone(a)
+        self.assertNotEqual(a, b)
+
+    def test_src_hash_missing_file_is_none(self):
+        self.assertIsNone(run_metrics.src_hash("/不存在/172.py"))
+
+    # ── rid 集合 hash / 差集 ────────────────────────────────────────
+    def test_rid_set_hash_is_order_independent(self):
+        """集合无序 → 必须先排序，否则同一页面每次 hash 都不同（假变化）。"""
+        self.assertEqual(run_metrics.rid_set_hash(["b", "a", "c"]),
+                         run_metrics.rid_set_hash(["c", "a", "b"]))
+
+    def test_rid_set_hash_empty_is_none(self):
+        self.assertIsNone(run_metrics.rid_set_hash([]))
+        self.assertIsNone(run_metrics.rid_set_hash(None))
+
+    def test_rid_diff(self):
+        gone, new = run_metrics.rid_diff(["a", "b"], ["b", "c"])
+        self.assertEqual(gone, ["a"])
+        self.assertEqual(new, ["c"])
+
+    def test_rid_diff_without_baseline_is_none(self):
+        """无基线 → (None, None)，由调用方标"跳过对比"而非"未归因"（§10.2）。"""
+        self.assertEqual(run_metrics.rid_diff(None, ["a"]), (None, None))
+        self.assertEqual(run_metrics.rid_diff(["a"], None), (None, None))
+
+    # ── 静态指标打包 / 环境变量传递 / 白名单 ────────────────────────
+    def test_collect_static_passes_gate_counts(self):
+        p = self._mk(self._CASE)
+        m = run_metrics.collect_static(
+            p, {"lint_errors": 2, "check_facts_suspects": 1, "checked_words": 5})
+        self.assertEqual(m["sleep_static_sec"], 3.5)
+        self.assertEqual(m["gate_lint_errors"], 2)
+        self.assertEqual(m["gate_check_facts_suspects"], 1)
+        self.assertEqual(m["gate_checked_words"], 5)
+        self.assertIsNotNone(m["script_hash"])
+
+    def test_static_env_roundtrip(self):
+        old = os.environ.get(run_metrics.ENV_STATIC)
+        self.addCleanup(lambda: os.environ.pop(run_metrics.ENV_STATIC, None)
+                        if old is None else
+                        os.environ.__setitem__(run_metrics.ENV_STATIC, old))
+        run_metrics.dump_static({"script_hash": "h"})
+        self.assertEqual(run_metrics.load_static()["script_hash"], "h")
+        os.environ[run_metrics.ENV_STATIC] = "{坏 json"
+        self.assertEqual(run_metrics.load_static(), {})   # 坏数据不炸收尾
+
+    def test_sanitize_extra_drops_unknown_keys(self):
+        """未知键必须丢掉：拼错的列名进 SQL 会 no such column → 整条记录丢失。"""
+        out = run_metrics.sanitize_extra({"script_hash": "h", "bogus": 1})
+        self.assertEqual(out, {"script_hash": "h"})
+
+    # ── 落库 + 取基线（§7.1「基线必须不受保留策略影响」）────────────
+    def test_metrics_extra_roundtrip_and_baseline(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        rdb = db.RecordDB(os.path.join(tmp, "t.db"))
+        rdb.record_metrics("/x/172.py", "dev-1", 12.5, dump=3,
+                           script_hash="abc", rid_set_hash="h1",
+                           rid_set='["a","b"]', screenshots=7, wait_calls=2,
+                           bogus_col="应该被忽略")
+        m = rdb.latest_metrics("/x/172.py")
+        self.assertEqual(m["script_hash"], "abc")
+        self.assertEqual(m["rid_set_hash"], "h1")
+        self.assertEqual(m["rid_set"], '["a","b"]')
+        self.assertEqual(m["duration_sec"], 12.5)
+
+    def test_latest_metrics_empty_when_no_history(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        rdb = db.RecordDB(os.path.join(tmp, "t.db"))
+        self.assertEqual(rdb.latest_metrics("/x/never.py"), {})
+
+    # ── M2 防作弊口径：sleep 挪进 _flow.py 不算数 ───────────────────
+    def _pkg_dir(self, case_body, flow_body=None, lib=None):
+        td = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, td, True)
+        case = os.path.join(td, "178.py")
+        with open(case, "w", encoding="utf-8") as f:
+            f.write(case_body)
+        if flow_body is not None:
+            with open(os.path.join(td, "_flow.py"), "w", encoding="utf-8") as f:
+                f.write(flow_body)
+        if lib:
+            os.makedirs(os.path.join(td, "_lib"))
+            for name, body in lib.items():
+                with open(os.path.join(td, "_lib", name), "w",
+                          encoding="utf-8") as f:
+                    f.write(body)
+        return case
+
+    def test_sleep_with_flow_counts_sibling_flow(self):
+        """把 sleep 从用例挪进 `_flow.py` → case-only 变小、with_flow 不变。"""
+        case = self._pkg_dir("import time\n\ndef run():\n    time.sleep(2)\n",
+                             "import time\n\ndef goto(t):\n    time.sleep(3)\n")
+        self.assertEqual(run_metrics.sleep_static_seconds(case), 2.0)
+        self.assertEqual(run_metrics.sleep_seconds_with_flow(case), 5.0)
+
+    def test_sleep_with_flow_counts_lib(self):
+        case = self._pkg_dir("x = 1\n", lib={
+            "helper.py": "import time\n\ndef h():\n    time.sleep(1.5)\n",
+            "__init__.py": "",
+        })
+        names = [os.path.basename(p)
+                 for p in run_metrics.sibling_aux_sources(case)]
+        self.assertIn("helper.py", names)
+        self.assertNotIn("__init__.py", names)   # dunder 不算源文件
+        self.assertEqual(run_metrics.sleep_seconds_with_flow(case), 1.5)
+
+    def test_sleep_with_flow_without_aux_is_case_only(self):
+        case = self._pkg_dir("import time\n\ndef run():\n    time.sleep(4)\n")
+        self.assertEqual(run_metrics.sleep_seconds_with_flow(case), 4.0)
+
+    def test_sleep_with_flow_counts_cases_root_lib(self):
+        """**实测布局**：共享库在 cases 根（`cases/_lib/`），不在包目录下。
+
+        只查"用例同目录"会漏掉它 —— 那样把 sleep 挪进 `cases/_lib` 就能让
+        M2 变绿。这条锁住两个位置都查。
+        """
+        td = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, td, True)
+        pkg = os.path.join(td, "com.pkg")
+        os.makedirs(pkg)
+        case = os.path.join(pkg, "178.py")
+        with open(case, "w", encoding="utf-8") as f:
+            f.write("import time\n\ndef run():\n    time.sleep(1)\n")
+        with open(os.path.join(pkg, "_flow.py"), "w", encoding="utf-8") as f:
+            f.write("import time\n\ndef g(t):\n    time.sleep(2)\n")
+        lib = os.path.join(td, "_lib")          # cases 根下的共享库
+        os.makedirs(lib)
+        with open(os.path.join(lib, "inventory.py"), "w",
+                  encoding="utf-8") as f:
+            f.write("import time\n\ndef i():\n    time.sleep(4)\n")
+        names = [os.path.basename(p)
+                 for p in run_metrics.sibling_aux_sources(case)]
+        self.assertEqual(names, ["_flow.py", "inventory.py"])
+        self.assertEqual(run_metrics.sleep_seconds_with_flow(case), 7.0)
+
+
+# ── P0a：版本门禁 + 双信号源归因（§4.1 / §10.2）─────────────────────
+class TestVersionGate(unittest.TestCase):
+    """dumpsys 解析 / 知识卡验证版本 / 六类归因码 / WARN 判定。
+
+    门禁的定位是"挂的时候消灭歧义"：只打 WARN、不废缓存。因此**误报比漏报更
+    有害**（假信号会稀释真信号），本类重点锁"不该报的不报"：
+    首次运行不报、改脚本不报、换设备不报（更不许当成配置变更报）。
+    """
+
+    _DUMPSYS = """Packages:
+  Package [com.zui.calendar] (8f2a):
+    versionCode=83 minSdk=28 targetSdk=33
+    versionName=9.0.0.83
+"""
+
+    def _card_dir(self, pkg, body):
+        td = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, td, True)
+        with open(os.path.join(td, f"{pkg}.md"), "w", encoding="utf-8") as f:
+            f.write(body)
+        return td
+
+    # ── dumpsys 解析 ───────────────────────────────────────────────
+    def test_parse_version(self):
+        self.assertEqual(version_gate.parse_version(self._DUMPSYS),
+                         ("9.0.0.83", "83"))
+
+    def test_parse_version_garbage_is_none(self):
+        """解析不到就回 None —— 门禁宁可不判，也不猜一个版本号出来。"""
+        self.assertEqual(version_gate.parse_version(""), (None, None))
+        self.assertEqual(version_gate.parse_version("no version here"),
+                         (None, None))
+
+    # ── 知识卡「验证版本」 ─────────────────────────────────────────
+    def test_read_card_version(self):
+        d = self._card_dir("com.x", "# X\n\n- **app**: `com.x`｜"
+                                    "**验证版本**: 1.2.3｜**最近验证**: 2026-09-14\n")
+        self.assertEqual(version_gate.read_card_version([d], "com.x"), "1.2.3")
+
+    def test_read_card_version_missing_field_is_none(self):
+        """卡里没该字段 → None。**缺失 ≠ 失配**（5 张卡里只有 1 张有这个字段，
+        把缺失当"版本变了"会造成大面积误报）。"""
+        d = self._card_dir("com.y", "# Y\n\n没有版本字段的卡\n")
+        self.assertIsNone(version_gate.read_card_version([d], "com.y"))
+        self.assertIsNone(version_gate.read_card_version([d], "com.nothere"))
+        self.assertIsNone(version_gate.read_card_version([], "com.y"))
+
+    # ── 归因码（§10.2 决策表）──────────────────────────────────────
+    def _prev(self, **kw):
+        base = {"script_hash": "h1", "app_version_name": "9.0.0.83",
+                "app_version_code": "83", "rid_set_hash": "r1", "device": "dev-a"}
+        base.update(kw)
+        return base
+
+    def test_no_baseline(self):
+        self.assertEqual(version_gate.classify({}, self._prev())[0], "no_baseline")
+
+    def test_script_hash_wins(self):
+        """脚本自己改过 → 归因 script，且**优先于**版本/指纹（最常见先排除）。"""
+        code, _ = version_gate.classify(
+            self._prev(), self._prev(script_hash="h2", app_version_name="10.0",
+                                     rid_set_hash="r2"))
+        self.assertEqual(code, "script")
+
+    def test_apk_on_version_change(self):
+        code, detail = version_gate.classify(
+            self._prev(), self._prev(app_version_name="10.0.0.1",
+                                     app_version_code="90"))
+        self.assertEqual(code, "apk")
+        self.assertIn("10.0.0.1", detail)
+
+    def test_layout_beats_config(self):
+        """换设备 → layout（**不许**报成 config）：换机时 rid 集合天然不同，
+        若让 config 先命中，每次换机都会误报"服务端配置变更"。"""
+        code, _ = version_gate.classify(
+            self._prev(), self._prev(device="dev-b", rid_set_hash="r2"))
+        self.assertEqual(code, "layout")
+
+    def test_config_on_fingerprint_change_only(self):
+        """版本与脚本都没变、界面变了 → config（服务端下发 / A-B）。"""
+        code, detail = version_gate.classify(
+            self._prev(), self._prev(rid_set_hash="r2"))
+        self.assertEqual(code, "config")
+        self.assertIn("版本未变但界面已变", detail)
+
+    def test_unchanged(self):
+        self.assertEqual(version_gate.classify(self._prev(), self._prev())[0],
+                         "unchanged")
+
+    # ── WARN 判定 ──────────────────────────────────────────────────
+    def test_config_change_warns(self):
+        lines, code = version_gate.gate_warn_lines(
+            self._prev(), self._prev(rid_set_hash="r2"))
+        self.assertEqual(code, "config")
+        self.assertEqual(len(lines), 1)
+
+    def test_script_change_does_not_warn(self):
+        """改脚本不告警：那不是产品变更（SKILL.md：失败多为改脚本的中间态），
+        给它 WARN 只会稀释真信号。"""
+        lines, code = version_gate.gate_warn_lines(
+            self._prev(), self._prev(script_hash="h2"))
+        self.assertEqual(code, "script")
+        self.assertEqual(lines, [])
+
+    def test_unchanged_does_not_warn(self):
+        lines, _ = version_gate.gate_warn_lines(self._prev(), self._prev())
+        self.assertEqual(lines, [])
+
+    def test_no_baseline_does_not_warn(self):
+        lines, code = version_gate.gate_warn_lines({}, self._prev())
+        self.assertEqual(code, "no_baseline")
+        self.assertEqual(lines, [])
+
+    def test_card_version_mismatch_warns_even_without_other_change(self):
+        """与知识卡「验证版本」失配 → 单独告警（缓存是旧版本时期的）。"""
+        lines, code = version_gate.gate_warn_lines(
+            self._prev(), self._prev(), card_version="8.0.0.1")
+        self.assertEqual(code, "unchanged")
+        self.assertEqual(len(lines), 1)
+        self.assertIn("8.0.0.1", lines[0])
+
+    # ── 2026-09-16 真机实测补充的两条 ─────────────────────────────
+    def test_norm_version_drops_build_suffix(self):
+        """真机实测：卡里 `9.0.0.83`，真机 `9.0.0.83-2026.07.22-release`。
+
+        逐字符比会在**每次运行**都报失配 —— 而假 WARN 比漏报更糟：它会训练人
+        忽略这条告警，等真失配时也就没人看了。
+        """
+        self.assertEqual(
+            version_gate.norm_version("9.0.0.83-2026.07.22-release"), "9.0.0.83")
+        self.assertEqual(version_gate.norm_version(" 1.2.3 "), "1.2.3")
+        self.assertEqual(version_gate.norm_version("1.2.3+build9"), "1.2.3")
+        self.assertEqual(version_gate.norm_version(None), "")
+
+    def test_card_version_abbreviation_no_false_warn(self):
+        """卡里写简写 + 真机带构建后缀 → **不告警**（归一化后相同）。
+
+        prev/cur 用**同一个真机值**：真实流程里两者都来自设备采集，这里要隔离的是
+        "卡 vs 真机"这一层比对，不是"上次 vs 这次"（后者见下面两条）。
+        """
+        real = "9.0.0.83-2026.07.22-release"
+        lines, code = version_gate.gate_warn_lines(
+            self._prev(app_version_name=real), self._prev(app_version_name=real),
+            card_version="9.0.0.83")
+        self.assertEqual(code, "unchanged")
+        self.assertEqual(lines, [])
+
+    def test_card_mismatch_line_is_single_source(self):
+        """卡失配判断只有**一份**实现：run_case 启动打印与 finish 告警必须同结论。
+
+        回归 2026-09-16 真机实测：两处各写一份精确比较 → 只给 finish 那条加了
+        归一化 → 启动时照样报假 WARN（看上去像"改了没生效"，实为另一份副本）。
+        """
+        real = "9.0.0.83-2026.07.22-release"
+        # 一致（卡里是简写）→ 两处都不报
+        self.assertIsNone(version_gate.card_mismatch_line("9.0.0.83", real))
+        lines, _ = version_gate.gate_warn_lines(
+            self._prev(app_version_name=real), self._prev(app_version_name=real),
+            card_version="9.0.0.83")
+        self.assertEqual(lines, [])
+        # 真失配 → 两处都报，且**文案完全相同**（同源）
+        self.assertIsNotNone(version_gate.card_mismatch_line("8.0.0.1", real))
+        lines2, _ = version_gate.gate_warn_lines(
+            self._prev(app_version_name=real), self._prev(app_version_name=real),
+            card_version="8.0.0.1")
+        self.assertEqual(lines2,
+                         [version_gate.card_mismatch_line("8.0.0.1", real)])
+
+    def test_card_mismatch_line_needs_both_sides(self):
+        """单侧缺失（没卡 / 没采到版本）→ None，**不判失配**（缺失 ≠ 变化）。"""
+        self.assertIsNone(version_gate.card_mismatch_line("", "1.0"))
+        self.assertIsNone(version_gate.card_mismatch_line("1.0", None))
+        self.assertIsNone(version_gate.card_mismatch_line(None, None))
+
+    def test_build_suffix_change_counts_as_apk(self):
+        """只有构建后缀变（同版本号重新打包）也算 apk —— 那是新 APK 的信号。
+
+        与上一条的区别：卡比对**归一化**（容忍人手写简写），而"上次 vs 这次"
+        采集值**精确比**（重新打包确实换了包）。两处口径不同是刻意的。
+        """
+        code, _ = version_gate.classify(
+            self._prev(app_version_name="9.0.0.83-2026.07.22-release"),
+            self._prev(app_version_name="9.0.0.83-2026.08.01-release"))
+        self.assertEqual(code, "apk")
+
+    def test_version_code_change_wins_over_same_name(self):
+        """versionName 没变但 versionCode 变了 → 仍是 apk（P2 后主判据）。"""
+        code, _ = version_gate.classify(
+            self._prev(app_version_code="90083"),
+            self._prev(app_version_code="90084"))
+        self.assertEqual(code, "apk")
+
+    def test_old_record_without_comparable_fields_is_no_baseline(self):
+        """有历史记录但字段全 NULL（RunMetrics 上线前的旧记录）→ `no_baseline`。
+
+        不这么判会落进 `unchanged`，而 `unchanged` 是"**比过了**、没变"的结论 ——
+        实测 2026-09-16：168 首跑就报 `unchanged`（当时库里只有旧记录）。
+        """
+        old = {"id": 37, "started_at": "2026-09-14T10:00:00"}
+        code, detail = version_gate.classify(old, self._prev())
+        self.assertEqual(code, "no_baseline")
+        self.assertIn("缺少可比字段", detail)
+
+
+# ── P1b：同 dump 优先级定位（§4.2）────────────────────────────────
+@unittest.skipIf(_tf is None, "需要 uiautomator2（用工作区 venv 跑本测试）")
+class TestPriorityMatch(unittest.TestCase):
+    """rid > desc > text 的**优先级**语义 + 同 dump 内降级。
+
+    回归点：旧实现是"同一循环里 OR"，按**树序**返回任一属性命中的第一个节点
+    —— 于是 tap_el(rid=R, text=T) 可能点到树上更靠前、text==T 的无关节点，
+    SKILL.md 约定的优先级形同虚设（实为潜在误点，比找不到更危险）。
+    """
+
+    @staticmethod
+    def _n(rid=None, text=None, desc=None, bounds=(0, 0, 10, 10)):
+        return {"rid": rid or "", "text": text or "", "desc": desc or "",
+                "bounds_xy": bounds}
+
+    def test_rid_wins_over_text_even_if_text_node_is_earlier(self):
+        nodes = [self._n(text="保存"), self._n(rid="id_save")]
+        n, layer, status = tf._priority_match(nodes, rid="id_save", text="保存")
+        self.assertEqual((layer, status), ("rid", "hit"))
+        self.assertEqual(n["rid"], "id_save")
+
+    def test_desc_wins_over_text(self):
+        nodes = [self._n(text="保存"), self._n(desc="保存")]
+        n, layer, _ = tf._priority_match(nodes, desc="保存", text="保存")
+        self.assertEqual(layer, "desc")
+
+    def test_falls_back_to_text_when_rid_absent(self):
+        """rid 完全不在树上 → 允许降级到 text，但**必须标 fallback**（留痕用）。"""
+        nodes = [self._n(text="保存")]
+        n, layer, status = tf._priority_match(nodes, rid="id_save",
+                                             desc="保存btn", text="保存")
+        self.assertEqual((layer, status), ("text", "fallback"))
+        self.assertEqual(n["text"], "保存")
+
+    def test_only_text_given_is_not_a_fallback(self):
+        """没传 rid 时 text 命中就是 hit —— 不许把正常用法记成"降级"。"""
+        n, layer, status = tf._priority_match([self._n(text="保存")],
+                                             text="保存")
+        self.assertEqual((layer, status), ("text", "hit"))
+        self.assertIsNotNone(n)
+
+    def test_no_match_returns_miss(self):
+        n, layer, status = tf._priority_match([self._n(rid="other")],
+                                             rid="id_save")
+        self.assertIsNone(n)
+        self.assertIsNone(layer)
+        self.assertEqual(status, "miss")
+
+    # ── 正确性保证（2026-09-16 人确认：rid 优先，且要保证取到的是对的节点）──
+    def test_rid_present_without_bounds_does_not_fall_back(self):
+        """**最重要的一条**：rid 在树上但无 bounds → 绝不降级去匹配 text。
+
+        这是"该滚的时候去猜 text"的防线：出屏/折叠的元素，正确答案是滚动或
+        报找不到；退到 text 会命中一个同名乱入的无关节点并"成功"点到错的东西
+        —— 比找不到更危险（报告还是绿的）。
+        """
+        nodes = [self._n(rid="id_save", bounds=None),
+                 self._n(text="保存")]          # 树上另有一个同名 text 节点
+        n, layer, status = tf._priority_match(nodes, rid="id_save", text="保存")
+        self.assertIsNone(n)
+        self.assertEqual(layer, "rid")
+        self.assertEqual(status, "present_no_bounds")
+
+    def test_multiple_rid_prefers_clickable(self):
+        """同一 rid 挂在容器与子控件上时，优先取 clickable 的那个。"""
+        nodes = [self._n(rid="id_item", bounds=(0, 0, 900, 300)),      # 容器
+                 self._n(rid="id_item", bounds=(10, 10, 200, 60))]     # 子控件
+        nodes[1]["clickable"] = "true"
+        n, _layer, status = tf._priority_match(nodes, rid="id_item")
+        self.assertEqual(n["bounds_xy"], (10, 10, 200, 60))
+        self.assertEqual(status, "hit")
+
+    def test_multiple_rid_prefers_smallest_area_when_none_clickable(self):
+        """都不可点击时取**面积最小**的（容器通常更大、更"外"）。"""
+        nodes = [self._n(rid="id_item", bounds=(0, 0, 900, 300)),
+                 self._n(rid="id_item", bounds=(10, 10, 200, 60))]
+        n, _layer, _status = tf._priority_match(nodes, rid="id_item")
+        self.assertEqual(n["bounds_xy"], (10, 10, 200, 60))
+
+    def test_ambiguous_flagged_when_indistinguishable(self):
+        """同面积并列 → 取一个但标 ambiguous，**不静默选第一个**。"""
+        nodes = [self._n(rid="id_item", bounds=(0, 0, 100, 100)),
+                 self._n(rid="id_item", bounds=(0, 200, 100, 300))]
+        n, layer, status = tf._priority_match(nodes, rid="id_item")
+        self.assertIsNotNone(n)
+        self.assertEqual((layer, status), ("rid", "ambiguous"))
+
+    def test_local_name_compat(self):
+        """兼容某些 dump 只回本地名（无包名前缀）的形态。"""
+        nodes = [self._n(rid="id_save")]
+        n, layer, status = tf._priority_match(nodes, rid="com.demo:id/id_save")
+        self.assertIsNotNone(n)
+        self.assertEqual((layer, status), ("rid", "hit"))
+
+    def test_exact_match_wins_over_local_compat(self):
+        """精确匹配优先：本地名兼容是第二级，不能让跨包同名节点抢先命中。"""
+        nodes = [self._n(rid="otherpkg:id/id_save"), self._n(rid="com.demo:id/id_save")]
+        n, _l, _s = tf._priority_match(nodes, rid="com.demo:id/id_save")
+        self.assertEqual(n["rid"], "com.demo:id/id_save")
+
+    def test_same_dump_only_one_source(self):
+        """三级降级共用**同一份** nodes（§4.2「只允许同一 dump 内降级」）。
+
+        本函数不接 dump 回调、只吃 nodes 列表 —— 结构上不可能跨 dump 重找，
+        这条锁的是"不引入第二次采集"的设计约束。
+        """
+        nodes = [self._n(desc="保存")]
+        n1, l1, _ = tf._priority_match(nodes, rid="x", desc="保存")
+        n2, l2, _ = tf._priority_match(nodes, rid="x", desc="保存")
+        self.assertIs(n1, n2)          # 同一份列表 → 同一结果，无隐藏重查
+        self.assertEqual((l1, l2), ("desc", "desc"))
+
+
+# ── P1b：wait_gone / scroll_to_rid / region_of / 快照复用 ───────────
+@unittest.skipIf(_tf is None, "需要 uiautomator2")
+class TestP1bApis(unittest.TestCase):
+    def _bare(self):
+        t = object.__new__(_tf.TestCase)
+        t.steps = []
+        t._cur_step = None
+        t._db = None
+        t._db_case_id = None
+        t.trace = None
+        return t
+
+    # wait_gone -----------------------------------------------------
+    def test_wait_gone_requires_a_criterion(self):
+        """无判据 → 抛 ValueError，**不许**静默返回 True（那是假 PASS）。"""
+        with self.assertRaises(ValueError):
+            self._bare().wait_gone()
+
+    def test_wait_gone_true_when_absent(self):
+        t = self._bare()
+        t.el_bounds = lambda **kw: None
+        self.assertTrue(t.wait_gone(rid="gone_rid", timeout=0.1))
+
+    def test_wait_gone_false_when_still_present(self):
+        t = self._bare()
+        t.el_bounds = lambda **kw: (0, 0, 10, 10)
+        self.assertFalse(t.wait_gone(rid="still_here", timeout=0.1,
+                                     interval=0.05))
+
+    # wait_text_contains -------------------------------------------
+    def test_wait_text_contains_hits_substring(self):
+        """子串等待：`wait_text` 是精确匹配，表达不了"某句话里含某个词"。
+
+        真机场景（178）：询问框文案是整句「是否根据课程时长和休息时长**自动调整**
+        其他课程」，等它只能按子串 —— 旧写法是 sleep(2.5) 后一次性读屏。
+        """
+        t = self._bare()
+        t.screen_text = lambda: ["是否根据课程时长和休息时长自动调整其他课程"]
+        self.assertTrue(t.wait_text_contains("自动调整", timeout=0.2))
+
+    def test_wait_text_contains_timeout(self):
+        t = self._bare()
+        t.screen_text = lambda: ["别的文案"]
+        self.assertFalse(t.wait_text_contains("自动调整", timeout=0.1,
+                                             interval=0.05))
+
+    def test_wait_text_contains_does_not_fake_exact_match(self):
+        """它**不是** `wait_text` 的替代品：精确匹配仍走 `wait_text`。"""
+        t = self._bare()
+        t.screen_text = lambda: ["取消", "确定"]
+        self.assertTrue(t.wait_text_contains("消", timeout=0.2))   # 子串命中
+        self.assertTrue(t.wait_text_contains("取消", timeout=0.2))  # 精确也是子串
+
+    # wait_text_any_contains ---------------------------------------
+    def test_wait_any_contains_returns_matched_word(self):
+        """多候选共享一个预算，并返回**命中的那个**（同时回答"等到了"+"是哪种"）。"""
+        t = self._bare()
+        t.screen_text = lambda: ["应用权限", "前往设置"]
+        self.assertEqual(t.wait_text_any_contains(("相机权限", "前往设置"),
+                                                  timeout=0.2), "前往设置")
+
+    def test_wait_any_contains_does_not_double_budget(self):
+        """关键是**共享预算**：顺序等两次会把时间翻倍（3+3=6s）。"""
+        t = self._bare()
+        calls = []
+
+        def _st():
+            calls.append(1)
+            return ["无关文案"]
+        t.screen_text = _st
+        import time as _t
+        t0 = _t.time()
+        self.assertEqual(t.wait_text_any_contains(("a", "b", "c"), timeout=0.3,
+                                                  interval=0.05), "")
+        self.assertLess(_t.time() - t0, 1.0)      # 不是 0.3×3
+        self.assertGreaterEqual(len(calls), 2)
+
+    def test_wait_any_contains_requires_candidates(self):
+        """空候选 → 抛错（不许静默超时：那会变成"等了个寂寞"）。"""
+        with self.assertRaises(ValueError):
+            self._bare().wait_text_any_contains([], timeout=0.1)
+
+    # scroll_to_rid -------------------------------------------------
+    def test_scroll_returns_immediately_when_visible(self):
+        """已在树上 → 不滑动（省一次 swipe，也避免把页面滚走）。"""
+        t = self._bare()
+        t._screen_size = lambda: (1080, 2400)
+        swiped = []
+        t.swipe = lambda *a, **k: swiped.append(a) or True
+        t.el_bounds = lambda **kw: (0, 100, 10, 200)
+        self.assertEqual(t.scroll_to_rid("rid_x"), (0, 100, 10, 200))
+        self.assertEqual(swiped, [])
+
+    def test_scroll_swipes_until_found(self):
+        t = self._bare()
+        t._screen_size = lambda: (1080, 2400)
+        state = {"n": 0}
+        t.swipe = lambda *a, **k: state.__setitem__("n", state["n"] + 1) or True
+
+        def _eb(**kw):
+            return (0, 5, 10, 15) if state["n"] >= 2 else None
+        t.el_bounds = _eb
+        self.assertEqual(t.scroll_to_rid("rid_x", settle=0), (0, 5, 10, 15))
+        self.assertEqual(state["n"], 2)
+
+    def test_scroll_gives_up_and_returns_none(self):
+        t = self._bare()
+        t._screen_size = lambda: (1080, 2400)
+        t.swipe = lambda *a, **k: True
+        t.el_bounds = lambda **kw: None
+        self.assertIsNone(t.scroll_to_rid("never", max_swipes=2, settle=0))
+
+    def test_scroll_swipe_failure_breaks_loop(self):
+        """滑动本身失败（设备断连）→ 立刻退出，不做无意义的重试。"""
+        t = self._bare()
+        t._screen_size = lambda: (1080, 2400)
+        t.swipe = lambda *a, **k: False
+        t.el_bounds = lambda **kw: None
+        self.assertIsNone(t.scroll_to_rid("never", settle=0))
+
+    # region_of -----------------------------------------------------
+    def test_region_of_from_bounds(self):
+        t = self._bare()
+        t.el_bounds = lambda **kw: (100, 200, 300, 400)
+        self.assertEqual(t.region_of(rid="r", pad=10), (190, 410, 90, 310))
+
+    def test_region_of_none_when_element_absent(self):
+        """元素不存在 → None（调用方据此退化全屏，而不是拿到一个垃圾区间）。"""
+        t = self._bare()
+        t.el_bounds = lambda **kw: None
+        self.assertIsNone(t.region_of(rid="r"))
+
+    # dump 快照复用（M4）-------------------------------------------
+    def test_snapshot_reuses_within_ttl(self):
+        t = self._bare()
+        calls = []
+        t._dump = lambda: calls.append(1) or "<x/>"
+        t.dump_snapshot()
+        t.dump_snapshot()
+        self.assertEqual(len(calls), 1)      # 第二次走缓存，没再 dump
+
+    def test_snapshot_refresh_forces_new_dump(self):
+        t = self._bare()
+        calls = []
+        t._dump = lambda: calls.append(1) or "<x/>"
+        t.dump_snapshot()
+        t.dump_snapshot(refresh=True)
+        self.assertEqual(len(calls), 2)
+
+    def test_snapshot_expires_after_ttl(self):
+        t = self._bare()
+        calls = []
+        t._dump = lambda: calls.append(1) or "<x/>"
+        t.dump_snapshot(ttl=0)
+        t.dump_snapshot(ttl=0)
+        self.assertEqual(len(calls), 2)
+
+    # 截图降载（M3）------------------------------------------------
+    def _shot_case(self, **attrs):
+        t = self._bare()
+        t.case_dir = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, t.case_dir, True)
+        t._shot_idx = 0
+        t._db_step_id = None
+        t.SHOT_MAX_SIDE = 0        # 跳过压缩（本组测配额，不测编码）
+        t._cur_step = {"name": "s", "results": [], "evidences": []}
+        t._screencap_bytes = lambda: b"PNGDATA"
+        for k, v in attrs.items():
+            setattr(t, k, v)
+        return t
+
+    def test_shot_every_action_by_default(self):
+        """**默认不限张数**（2026-09-16 人确认：每步还是要留图）。
+
+        证据链优先于指标：M3 的 ≤6MB 靠**压缩**达成，不靠少截图。用"少留证"
+        换指标等于拿掉出错时唯一的排查依据。
+        """
+        t = self._shot_case()
+        self.assertEqual(t.SHOT_PER_STEP, 0)
+        p1 = t._auto_screenshot("a")
+        p2 = t._auto_screenshot("b")
+        self.assertTrue(p1 and os.path.isfile(p1))
+        self.assertTrue(p2 and os.path.isfile(p2))
+        self.assertEqual(len(t._cur_step["evidences"]), 2)
+
+    def test_shot_quota_switch_still_works(self):
+        """配额开关保留（压测/排查时临时收窄），显式设 1 时才生效。"""
+        t = self._shot_case()
+        t.SHOT_PER_STEP = 1
+        p1 = t._auto_screenshot("a")
+        p2 = t._auto_screenshot("b")
+        self.assertTrue(p1 and os.path.isfile(p1))
+        self.assertIsNone(p2)                       # 被配额挡掉
+        self.assertEqual(t._shot_skipped, 1)        # 但可统计，不是静默
+
+    def test_shot_force_bypasses_quota(self):
+        """失败证据（force=True）不受配额限制 —— 失败现场永远要留。"""
+        t = self._shot_case()
+        t.SHOT_PER_STEP = 1
+        t._auto_screenshot("a")
+        p = t._auto_screenshot("失败", force=True)
+        self.assertTrue(p and os.path.isfile(p))
+
+    def test_encode_shot_webp(self):
+        """M3 达标靠 WebP（实测 PNG 14.2MB / JPEG 11.6MB / WebP 3.7MB）。
+
+        这条锁"默认编码真的是 WebP 且真的变小了" —— 编码器静默退回 PNG 的话，
+        M3 会悄悄回到超标，而报告上看不出任何异常。
+        """
+        import io as _io
+        from PIL import Image
+        buf = _io.BytesIO()
+        Image.new("RGB", (1904, 3040), (240, 240, 240)).save(buf, format="PNG")
+        raw = buf.getvalue()
+        t = self._shot_case()
+        t.SHOT_MAX_SIDE, t.SHOT_FORMAT = 400, "webp"
+        out, ext = t._encode_shot(raw)
+        self.assertEqual(ext, "webp")
+        self.assertLess(len(out), len(raw))
+        # 约束的是**长边**（SHOT_MAX_SIDE 的语义），不是宽
+        self.assertEqual(max(Image.open(_io.BytesIO(out)).size), 400)
+
+    def test_encode_shot_png_option_and_fallback(self):
+        """`SHOT_FORMAT="png"` 走无损；输入不是图片时回退原图（不许丢证据）。"""
+        import io as _io
+        from PIL import Image
+        buf = _io.BytesIO()
+        Image.new("RGB", (800, 600), (10, 10, 10)).save(buf, format="PNG")
+        raw = buf.getvalue()
+        t = self._shot_case()
+        t.SHOT_MAX_SIDE, t.SHOT_FORMAT = 0, "png"
+        out, ext = t._encode_shot(raw)
+        self.assertEqual(ext, "png")
+        # 非图片字节 → 回退原图 PNG（不抛异常、不返回空）
+        out2, ext2 = t._encode_shot(b"NOT-AN-IMAGE")
+        self.assertEqual((out2, ext2), (b"NOT-AN-IMAGE", "png"))
+
+    def test_shot_quota_resets_each_step(self):
+        t = self._shot_case()
+        t.SHOT_PER_STEP = 1
+        t._auto_screenshot("a")
+        t._shot_in_step = 0          # 相当于 step() 重置
+        self.assertTrue(t._auto_screenshot("b"))
+
+    def test_dump_updates_snapshot(self):
+        """`_dump()` 必须更新 `_snap` —— 它是失败工件包 dump.xml 的**唯一**来源。
+
+        回归 2026-09-16 真机实测：原来只有 `dump_snapshot()` 写 `_snap`，而实际
+        采集路径（`el_bounds` / `wait_*` / `screen_text`）都直接调 `_dump()`
+        → `_snap` 恒为 None → **每次失败工件包都没有 dump.xml**（只剩
+        state.json + 截图）。而"失败那一刻的 UI 树"正是工件包最有价值的产出。
+        """
+        t = self._bare()
+        t._dump_count = 0
+        t.trace = mock.Mock()
+        t.ensure_awake = lambda *a, **k: None
+        t.d = mock.Mock()
+        t.d.dump_hierarchy.return_value = "<hierarchy/>"
+        self.assertIsNone(getattr(t, "_snap", None))
+        t._dump()
+        self.assertIsNotNone(getattr(t, "_snap", None))
+        self.assertEqual(t._snap[1], "<hierarchy/>")
+
+    # 失败工件包（§五）----------------------------------------------
+    def test_failure_bundle_written(self):
+        t = self._shot_case()
+        t.SHOT_PER_STEP = 0
+        t._snap = (time.time(), "<hierarchy>现场</hierarchy>")
+        t.current_package = lambda: "com.demo"
+        t.current_activity = lambda: "DemoActivity"
+        t.adb_shell = lambda *a: "0"
+        d = t._write_failure_bundle("断言失败：课程仍在")
+        self.assertTrue(os.path.isdir(d))
+        self.assertIn("dump.xml", os.listdir(d))
+        self.assertIn("state.json", os.listdir(d))
+        with open(os.path.join(d, "dump.xml"), encoding="utf-8") as f:
+            self.assertIn("现场", f.read())
+        with open(os.path.join(d, "state.json"), encoding="utf-8") as f:
+            st = json.load(f)
+        self.assertEqual(st["activity"], "DemoActivity")
+        self.assertTrue(st["has_dump"])
+
+    def test_failure_bundle_without_snapshot_says_so(self):
+        """没有 dump 快照时不假装有：has_dump=False（而不是写个空 XML）。"""
+        t = self._shot_case()
+        t.SHOT_PER_STEP = 0
+        t.current_package = lambda: "com.demo"
+        t.current_activity = lambda: ""
+        t.adb_shell = lambda *a: "0"
+        d = t._write_failure_bundle("x")
+        self.assertFalse(os.path.exists(os.path.join(d, "dump.xml")))
+        with open(os.path.join(d, "state.json"), encoding="utf-8") as f:
+            self.assertFalse(json.load(f)["has_dump"])
+
+
+# ── P1b：BLOCKED 变体 + 退出码（§2.2 / §10.3）──────────────────────
+@unittest.skipIf(_tf is None, "需要 uiautomator2")
+class TestBlockedSemantics(unittest.TestCase):
+    def _bare(self):
+        t = object.__new__(_tf.TestCase)
+        t.steps = [{"name": "s", "results": [], "evidences": []}]
+        t._cur_step = t.steps[0]
+        t._db = None
+        t._db_case_id = None
+        t.trace = None
+        t._stop_after = None
+        t._shot_idx = 0
+        t.case_dir = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, t.case_dir, True)
+        # 失败工件包会写盘；本组只关心语义，直接短路它
+        t._write_failure_bundle = lambda detail: None
+        return t
+
+    def test_case_blocked_is_case_abort(self):
+        """继承 CaseAbort → 复用"中止 + 照常出报告"的路径。"""
+        self.assertTrue(issubclass(_tf.CaseBlocked, _tf.CaseAbort))
+
+    def test_block_unless_passes_when_true(self):
+        t = self._bare()
+        self.assertTrue(t.block_unless(True, "不该触发"))
+        self.assertEqual(t.steps[0]["results"], [])
+
+    def test_block_unless_raises_and_records_blocked(self):
+        t = self._bare()
+        with self.assertRaises(_tf.CaseBlocked):
+            t.block_unless(False, "需要先有一条课程表", probe="emptyView 在")
+        r = t.steps[0]["results"][0]
+        self.assertEqual(r["result"], "BLOCKED")
+        self.assertIn("需要先有一条课程表", r["detail"])
+        self.assertIn("emptyView 在", r["detail"])
+
+    def test_block_unless_accepts_callable(self):
+        """惰性求值：cond 为 callable 时才在调用点求值（可含 dump 查询）。"""
+        t = self._bare()
+        seen = []
+        t.block_unless(lambda: seen.append(1) or True, "x")
+        self.assertEqual(seen, [1])
+
+    def test_block_unless_callable_exception_becomes_blocked(self):
+        """判定本身抛异常（设备断了）→ 记 BLOCKED，不是崩溃。"""
+        t = self._bare()
+        with self.assertRaises(_tf.CaseBlocked):
+            t.block_unless(lambda: 1 / 0, "前置")
+        self.assertIn("判定本身抛异常", t.steps[0]["results"][0]["detail"])
+
+    def test_require_on_absent_blocked_records_blocked(self):
+        t = self._bare()
+        t.tap_rid = lambda *a, **k: False
+        with self.assertRaises(_tf.CaseBlocked):
+            t.require_tap_rid("id_x", on_absent="BLOCKED")
+        self.assertEqual(t.steps[0]["results"][0]["result"], "BLOCKED")
+
+    def test_require_default_still_fail(self):
+        """默认仍是 FAIL —— BLOCKED 是显式选择，不能悄悄改变既有语义。"""
+        t = self._bare()
+        t.tap_rid = lambda *a, **k: False
+        with self.assertRaises(_tf.CaseAbort) as cm:
+            t.require_tap_rid("id_x")
+        self.assertNotIsInstance(cm.exception, _tf.CaseBlocked)
+        self.assertEqual(t.steps[0]["results"][0]["result"], "FAIL")
+
+    def test_exit_code_blocked_is_2(self):
+        """退出码陷阱（§2.2）：BLOCKED 必须是 2，不能被写成 FAIL 的 1。"""
+        import run_case
+        self.assertEqual(run_case.exit_code_for("BLOCKED"), 2)
+        self.assertEqual(run_case.exit_code_for("FAIL"), 1)
+
+
+# ── P2：知识索引生成器（§6.1 / §6.2 / §3.4）───────────────────────
+class TestKnowledgeIndex(unittest.TestCase):
+    """卡头解析必须吃掉**三种现状格式**，否则"生成式索引"第一次跑就失效。
+
+    这组用例的价值不在"脚本能跑"，而在**锁定格式容错**：现状卡并不统一
+    （表格 / 平铺词列表 / `「词」→「节」`引用块）。只支持一种，另一批卡的
+    触发词列就会变空 —— 而**空列看起来像"没写"，不像"解析失败"**（静默降级）。
+    """
+
+    def _card(self, body, name="com.test.app.md"):
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        p = os.path.join(d, name)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(body)
+        return d, p
+
+    def test_parse_list_header(self):
+        _, p = self._card("# T\n\n- **app**: `com.a`\n- **name**: A\n"
+                          "- **验证版本**: 1.2.3\n- **versionCode**: 12\n"
+                          "- **最近验证**: 2026-01-01\n")
+        c = ki_mod.parse_card(p)
+        self.assertEqual((c["app"], c["version_code"], c["version_name"]),
+                         ("com.a", "12", "1.2.3"))
+
+    def test_parse_merged_header(self):
+        """单行合并式（`**k**: v｜**k2**: v2`）是旧格式，不能因为"不整齐"就解析不到。"""
+        _, p = self._card("# T\n\n- **app**: `com.a`｜**验证版本**: 9.0.0.83｜"
+                          "**最近验证**: 2026-09-14（真机 31/31）\n")
+        c = ki_mod.parse_card(p)
+        self.assertEqual(c["version_name"], "9.0.0.83")
+        self.assertIn("31/31", c["last_verified"])
+
+    def test_explanatory_paren_dropped(self):
+        """字段值后的解释性括号必须丢掉：否则 `待采集（…）` 判据失效 → 告警静默消失。"""
+        _, p = self._card("# T\n\n- **app**: `com.a`\n"
+                          "- **versionCode**: 待采集（首次真机运行由 §4.1 落盘）\n")
+        self.assertEqual(ki_mod.parse_card(p)["version_code"], ki_mod.PENDING)
+
+    def test_non_app_card_skipped(self):
+        _, p = self._card("# T\n\n- **app**: `_system`\n", name="_system.md")
+        self.assertIsNone(ki_mod.parse_card(p))
+
+    def test_missing_app_field_returns_none(self):
+        _, p = self._card("# 没有 app 字段的 md\n\n随便写点\n")
+        self.assertIsNone(ki_mod.parse_card(p))
+
+    def test_triggers_from_quoted_map(self):
+        """引用块散文式（`com.zui.calendar.md` 形态）：只取「→」左边的词。"""
+        _, p = self._card("# T\n\n- **app**: `com.a`\n\n"
+                          "> **检索索引**：先用触发词定位。\n"
+                          "> 「导入 / 图库 / 拍照」→「标准链路」；\n"
+                          "> 「权限 / 相机」→「权限弹窗」。\n")
+        c = ki_mod.parse_card(p)
+        self.assertEqual(c["triggers"][:3], ["导入", "图库", "拍照"])
+        self.assertNotIn("标准链路", c["triggers"])    # 右侧是小节名，不是触发词
+
+    def test_triggers_from_plain_list(self):
+        """平铺词列表式（settings / launcher 形态）。"""
+        _, p = self._card("# T\n\n- **app**: `com.a`\n\n## 检索索引\n\n"
+                          "桌面、launcher、主屏幕、dock、长按、\n"
+                          "卸载、应用信息\n")
+        c = ki_mod.parse_card(p)
+        self.assertIn("桌面", c["triggers"])
+        self.assertIn("应用信息", c["triggers"])
+
+    def test_triggers_from_table(self):
+        _, p = self._card("# T\n\n- **app**: `com.a`\n\n## 检索索引\n\n"
+                          "| 触发词 | 小节 |\n|---|---|\n"
+                          "| 滚轮、时间选择器 | 「时间选择器」 |\n")
+        self.assertIn("滚轮", ki_mod.parse_card(p)["triggers"])
+
+    def test_triggers_not_grabbed_from_prose(self):
+        """解释性长句不能被当成触发词（否则索引里会出现整句中文）。"""
+        _, p = self._card("# T\n\n- **app**: `com.a`\n\n## 检索索引\n\n"
+                          "**这张表是按需读卡的入口**：Agent 先用关键词检索。\n"
+                          "不整卡进上下文（卡 400 行 ≈ 6.5k tokens）。\n"
+                          "桌面、dock\n")
+        self.assertEqual(ki_mod.parse_card(p)["triggers"], ["桌面", "dock"])
+
+    def test_index_heading_mention_in_body_is_not_heading(self):
+        """正文里提到「检索索引」不算节标题 —— 否则会从别处乱抽词。"""
+        self.assertFalse(ki_mod._is_index_heading("命中词补进「检索索引」"))
+        self.assertTrue(ki_mod._is_index_heading("## 检索索引"))
+        self.assertTrue(ki_mod._is_index_heading("> **检索索引**：..."))
+
+    def test_check_detects_drift(self):
+        """卡头改了但没刷新索引 → 必须能检出（这是"索引腐烂"的唯一防线）。"""
+        d, p = self._card("# T\n\n- **app**: `com.a`\n- **最近验证**: x\n")
+        ki_mod.write_index(kdir=d)
+        self.assertTrue(ki_mod.check_index(kdir=d)[0])
+        with open(p, "a", encoding="utf-8") as f:
+            f.write("- **versionCode**: 99\n")
+        ok, detail = ki_mod.check_index(kdir=d)
+        self.assertFalse(ok)
+        self.assertIn("不一致", detail)
+
+    def test_check_ignores_timestamp(self):
+        """生成时间戳每次都变，不能拿它当漂移（否则校验永远报红 = 噪音）。"""
+        d, _ = self._card("# T\n\n- **app**: `com.a`\n")
+        path = ki_mod.write_index(kdir=d)[0]
+        with open(path, encoding="utf-8") as f:
+            txt = f.read()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(txt.replace("于 2026", "于 2099"))
+        self.assertTrue(ki_mod.check_index(kdir=d)[0])
+
+    def test_check_reports_missing_index(self):
+        d, _ = self._card("# T\n\n- **app**: `com.a`\n")
+        ok, detail = ki_mod.check_index(kdir=d)
+        self.assertFalse(ok)
+        self.assertIn("不存在", detail)
+
+    def test_audit_finds_device_values(self):
+        """§3.4 缓存回流审计：bound/机型戳/屏幕尺寸要能被找出来（是清单不是门禁）。"""
+        d, _ = self._card("# T\n\n- **app**: `com.a`\n\n"
+                          "> bounds ≈ (503,2706)-(682,2889) [TB323FU]\n")
+        hits = ki_mod.audit(kdir=d)
+        self.assertTrue(hits)
+        self.assertTrue(any("机型戳" in h[2] or "bounds" in h[2] for h in hits))
+
+    def test_audit_clean_card_reports_nothing(self):
+        d, _ = self._card("# T\n\n- **app**: `com.a`\n\n"
+                          "> 坐标全部从活体 bounds 派生\n")
+        self.assertEqual(ki_mod.audit(kdir=d), [])
 
 
 if __name__ == "__main__":

@@ -1,6 +1,10 @@
 # ZUI 日历（联想平板）
 
-- **app**: `com.zui.calendar`｜**验证版本**: 9.0.0.83｜**最近验证**: 2026-09-14（178 真机 31/31）
+- **app**: `com.zui.calendar`
+- **name**: ZUI 日历（联想平板）
+- **验证版本**: 9.0.0.83（versionName，过渡期口径）
+- **versionCode**: 90083（2026-09-16 真机采集，TB323FU / Android 17；P2 后版本比对改用它）
+- **最近验证**: 2026-09-14（178 真机 31/31）
 - 无课程表前提：`adb shell pm clear com.zui.calendar`；图库/拍照导入的解析需联网（约 20s）
 
 > 本卡是给 AI 看的操作地图：先查「标准链路」命中就照走，不要从零探路。
@@ -161,6 +165,11 @@
 `EditTimetableActivity`），坑全在目标页：
 
 - 名称默认空且**必填**：不填点「完成」会被校验拦住（页面不动）；图库导入确认页才有预填名
+  - ⚠️ **与需求的差别（177 真机 2026-09-16）**：需求要求"名称为空时完成按钮**置灰**，
+    两项都有内容才可点击"；实测**按钮并不置灰**（`save_view` 的 `enabled=true`、
+    `clickable=true`），而是**点击后被校验拦住**（页面停在编辑页、无 toast 提示）。
+    即"必填约束存在、表现形式与需求不符"—— 不是校验缺失。
+    用例 `177.py` Step7 按需求断言置灰 → 记 FAIL 并附行为证据（点后是否被拦截）。
 - 保存 = toolbar 右侧 `save_view`（文本「完成」，clickable），**不是** `btn_finish`；
   `action_save` 是其不可点父容器
 - **不要按 back 收键盘**——back 会直接退出 `EditTimetableActivity` 丢编辑
@@ -344,8 +353,16 @@ Activity：`com.zui.calendar/.timetable.management.TimeSlotSettingsActivity`。
 - toolbar 标题 = 课表名，右侧/副行 = 当前周数（第1周）；结构 = viewPager + 表头周几
   （`tv_monday…tv_friday` + `_date`）+ recyclerView 网格（`tv_section` 节号 1-8 + `tv_time`）；
   顶栏 import/设置 = `action_curriculum_table_import` / `action_curriculum_table_settings`
-- 空格子 = `cv_empty_content`（clickable）。**点空格后出现加号浮标 `iv_add_hint`，再点加号
-  才进添加课程**，不是直接点空格弹框。「+」是图无文本/desc，判定用 rid 而非文本
+- 空格子 = `cv_empty_content`（clickable）。**点空格 → 直接进添加课程页**（EditCourseActivity），
+  不是弹框。
+- ⚠️ **改版（2026-09-17 探针实测 `evals/probe_addhint.py`）：加号中间态已移除。**
+  旧链路「点空格 → 出现加号浮标 `iv_add_hint` → 再点加号 → 进添加课程」**已不成立**：
+  点空格后**连续 4 次 dump（0.3/1.0/2.5/5.5s）UI 树完全没变、`iv_add_hint` 节点不存在**，
+  **第二次**点空格才进添加课程页（第一次点击被"吸收"）。
+  → 用例统一走 `_flow.open_新建课程(t)`（点一次不成再点一次、命中即停），
+  **不要再等 `iv_add_hint`**；176 / 182 因此项在 2026-09-16 全量套件里 FAIL。
+  （同轮框架指纹检测器报 `[WARN] 版本未变但界面已变` → 判定为 App 侧 config/AB 改版。）
+  「+」是图无文本/desc，判定用 rid 而非文本
 
 ## 添加 / 编辑课程页（EditCourseActivity）
 

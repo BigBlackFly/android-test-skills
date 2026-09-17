@@ -7,7 +7,9 @@
   拦住空名保存——用例文本未明示填名但产品要求，故此处填一个测试名再保存（用例差异已在知识卡标注）。
 - 完成保存后 = TimetableActivity（周视图）；周视图显示"周X日 + 第N周 + 8节时间"。
   顶部 toolbar 标题=课表名，副文本=当前周数（第1周）。第一格空内容 cv_empty_content 可点。
-  点空格后 iv_add_hint（加号提示）出现，再点加号 → EditCourseActivity 新建课程页。
+  点空格 → EditCourseActivity 新建课程页。
+  （⚠️ 2026-09-17 改版：中间的 `iv_add_hint` 加号已移除，且**第一次点击会被吸收、
+  第二次**才进编辑页；旧文档写的"点空格出现加号、再点加号"已不成立。）
 - 新建课程页 = EditCourseActivity：课程名(必填)/教室(非必填)/备注(非必填) →
 
 3字段
@@ -42,13 +44,14 @@ sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(_HERE)), "framework"))
 
 from test_framework import TestCase, _parse_nodes   # noqa: E402
-from _flow import goto_课程表空状态                  # noqa: E402
+from _flow import goto_课程表空状态, open_新建课程    # noqa: E402
 
 NAME_RID = "com.zui.calendar:id/et_schedule_name"
 SAVE_RID = "com.zui.calendar:id/action_save"
 BTN_MANUAL = "com.zui.calendar:id/btnCreateManually"
 EMPTY_CELL = "com.zui.calendar:id/cv_empty_content"
-ADD_HINT = "com.zui.calendar:id/iv_add_hint"
+# 注：`iv_add_hint`（旧的"点空格后出现的加号浮标"）**已从 App 移除**（2026-09-17
+# 探针实测），故不再作为定位目标 —— 链路直接走 _flow.open_新建课程()。
 COLOR_RID = "com.zui.calendar:id/llCourseColor"
 
 
@@ -100,6 +103,8 @@ def run():
         return t.finish()
     time.sleep(0.8)
     t.input_text(NAME_RID, "测试课程表")
+    # settle：等输入内容提交。**这类等待不可条件化**——变的是输入框的值而不是
+    # "某个元素出现"，`wait_*` 表达不了（审计归"合理"）。
     time.sleep(0.6)
     # toolbar 右侧 action_save；不按 back（避免退出页面）
     if not t.tap_rid(SAVE_RID, silent=True):
@@ -126,20 +131,14 @@ def run():
     if not ok:
         return t.finish()
 
-    # ── Step4 点加号 → 进入新建课程编辑页 ─────────────────────────
-    t.step("Step4 点第一个小节加号 → 添加课程编辑页")
-    b = t.el_bounds(rid=EMPTY_CELL)
-    if not b:
-        t.record("FAIL", "未找到第一个空格(cv_empty_content)")
+    # ── Step4 点空格 → 进入新建课程编辑页 ─────────────────────────
+    # ⚠️ App 已改版（2026-09-17 探针实测，见 evals/probe_addhint.py）：中间的
+    # 加号浮标 `iv_add_hint` **已被移除**，且**第一次点空格会被"吸收"、第二次**
+    # 才进编辑页。用例原先卡在"等加号"那一步 → 2026-09-16 全量套件在这里 FAIL。
+    # 现统一走 _flow.open_新建课程()（点一次不成再点一次，命中即停）。
+    t.step("Step4 点第一个小节空格 → 添加课程编辑页")
+    if not open_新建课程(t):
         return t.finish()
-    t.tap_xy((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
-    time.sleep(1.5)
-    if not t.el_bounds(rid=ADD_HINT):
-        t.record("FAIL", "点空格后加号(iv_add_hint)未出现")
-        return t.finish()
-    b2 = t.el_bounds(rid=ADD_HINT)
-    t.tap_xy((b2[0] + b2[2]) // 2, (b2[1] + b2[3]) // 2)
-    time.sleep(2.5)
     t.observe_dialogs(rounds=3)
     act = t.current_activity()
     txt = " ".join(t.screen_text())
@@ -216,8 +215,9 @@ def run():
     # ── Step6 back 关闭编辑页 → 回周视图 ─────────────────────────
     t.step("Step6 关闭编辑弹窗")
     t.d.press("back")
-    time.sleep(1.2)
-    act = t.current_activity()
+    # 等回到周视图：原来是 `sleep(1.2)` + 单次读 Activity —— 转场慢一点就会读到
+    # **旧 Activity** 而假 FAIL。wait_activity 命中即停（上限 5s）。
+    act = t.wait_activity("Timetable", timeout=5) or t.current_activity()
     ok = "Timetable" in act
     t.record("PASS" if ok else "FAIL",
              f"编辑弹窗关闭后回到周视图: activity={act}")

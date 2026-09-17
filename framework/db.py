@@ -165,6 +165,11 @@ CREATE TABLE IF NOT EXISTS suites (
 --   cases 表同一用例只留最新一条，回答不了"这次改动有没有更快"；
 --   本表按 script_path 累积，是趋势的唯一来源。
 --   duration_sec = 墙钟耗时，**唯一的性能口径**；
+--   ⚠️ dump_snaps 的**分母口径**（2026-09-16 人确认）：断言/定位点数 = results
+--     表里该用例的**全部 record 条数**（PASS+FAIL+WARN+BLOCKED+INFO），
+--     **不是** steps 表的行数 —— dump 的目的是"定位/断言前读一次屏"，而 step 是
+--     组织单位、不是工作量单位。178 实测同一批数据：按 step 是 15.0×、按 record
+--     是 2.7×，混用口径会让指标完全失真。M4 目标 ≤2×。
 --   ocr_calls / derived_clicks / dump_snaps 是合规性计数器
 --   （OCR 是否真跑 / 坐标是否从 bounds 派生 / dump 次数），
 --   **不要拿 dump_snaps 当性能指标**（178 实测 116 次只占 2.6% 耗时）。
@@ -205,7 +210,44 @@ _MIGRATIONS = [
     # 老库没有这两列 → NULL，health_check 按"未知"处理（不误计为变化）。
     "ALTER TABLE case_metrics ADD COLUMN rotation_start INTEGER",
     "ALTER TABLE case_metrics ADD COLUMN rotation_end INTEGER",
+    # ── RunMetrics 增量列（P0a，plan §7.1）────────────────────────────
+    # 为什么加在 case_metrics 上而不是新开 run_metrics 表：本表**已经是**
+    # append-only 且刻意不被 drop_previous_cases 清理（见建表注释），
+    # 天然满足 §7.1 对基线"不受保留策略影响"的要求；趋势也只有一处可查。
+    # 列名与 run_metrics.EXTRA_COLS 一致（白名单单一来源）。
+    "ALTER TABLE case_metrics ADD COLUMN package TEXT",
+    "ALTER TABLE case_metrics ADD COLUMN script_hash TEXT",
+    "ALTER TABLE case_metrics ADD COLUMN app_version_name TEXT",
+    "ALTER TABLE case_metrics ADD COLUMN app_version_code TEXT",
+    "ALTER TABLE case_metrics ADD COLUMN sleep_static_sec REAL",
+    # 含 _flow.py/_lib 的口径：防止"把 sleep 挪进 _flow.py 让 M2 变绿"（§7.2 M2）
+    "ALTER TABLE case_metrics ADD COLUMN sleep_static_sec_with_flow REAL",
+    # P5：自愈/降级命中次数（§7.1 质量维度）
+    "ALTER TABLE case_metrics ADD COLUMN healing_hits INTEGER",
+    "ALTER TABLE case_metrics ADD COLUMN wait_calls INTEGER",
+    "ALTER TABLE case_metrics ADD COLUMN wait_sec REAL",
+    "ALTER TABLE case_metrics ADD COLUMN screenshots INTEGER",
+    "ALTER TABLE case_metrics ADD COLUMN screenshot_bytes INTEGER",
+    "ALTER TABLE case_metrics ADD COLUMN rid_set TEXT",
+    "ALTER TABLE case_metrics ADD COLUMN rid_set_hash TEXT",
+    "ALTER TABLE case_metrics ADD COLUMN gate_lint_errors INTEGER",
+    "ALTER TABLE case_metrics ADD COLUMN gate_check_facts_suspects INTEGER",
+    "ALTER TABLE case_metrics ADD COLUMN gate_checked_words INTEGER",
 ]
+
+
+def _extra_metric_cols():
+    """RunMetrics 增量列白名单（单一来源：run_metrics.EXTRA_COLS）。
+
+    做成函数而不是模块级常量：run_metrics 与 db 同在 framework/ 下，正常都能
+    导入；万一不可用（裁剪/单文件环境）→ 返回空元组，退化成"只写基础列"，
+    总比记录整条写不进去好。
+    """
+    try:
+        from run_metrics import EXTRA_COLS
+        return EXTRA_COLS
+    except Exception:
+        return ()
 
 
 def _artifact_roots():
@@ -448,7 +490,8 @@ class RecordDB:
 
     # ── 度量（append-only）───────────────────────────────────────────
     def record_metrics(self, script_path, device, duration_sec,
-                       ocr=0, derived=0, dump=0, rot_start=None, rot_end=None):
+                       ocr=0, derived=0, dump=0, rot_start=None, rot_end=None,
+                       **extra):
         """写入一条用例度量；失败不抛（度量不该阻断用例收尾）。
 
         - script_path: 用例脚本路径（趋势按它聚合；直跑脚本时可能为 None → 跳过）
@@ -458,22 +501,58 @@ class RecordDB:
           两者不同 = 用例中途方向变过 —— 是「结论可信」事件，**不是性能指标**。
           探测失败/老库补列时为 None，**不要拿 None 当 0**（None 与 0 混同会把
           "未知"误报成"竖屏→横屏"）。
+        - extra: RunMetrics 增量列（P0a）。键名必须 ∈ run_metrics.EXTRA_COLS，
+          **未知键静默忽略**——拼错的键直接进 SQL 会报 no such column，
+          导致整条记录（含耗时）一起丢失，比"少记一列"严重得多。
         - started_at 在**这里**取 now 的 ISO 字符串，不接受 time.time() 的 float：
           否则 ORDER BY started_at 会退化成 float 排序，与 cases.started_at 混排。
         """
         if not script_path:
             return None
+        cols = [c for c in _extra_metric_cols() if c in extra]
+        names = ", ".join(cols)
+        marks = ",".join("?" * len(cols))
+        sql = ("INSERT INTO case_metrics (script_path, device, started_at,"
+               " duration_sec, ocr_calls, derived_clicks, dump_snaps,"
+               " rotation_start, rotation_end"
+               + (", " + names if names else "") + ")"
+               " VALUES (?,?,?,?,?,?,?,?,?" + ("," + marks if marks else "") + ")")
         with self._lock:
             self._connect().execute(
-                "INSERT INTO case_metrics (script_path, device, started_at,"
-                " duration_sec, ocr_calls, derived_clicks, dump_snaps,"
-                " rotation_start, rotation_end)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
+                sql,
                 (script_path, device,
                  datetime.now().isoformat(timespec="seconds"),
-                 duration_sec, ocr, derived, dump, rot_start, rot_end))
+                 duration_sec, ocr, derived, dump, rot_start, rot_end)
+                + tuple(extra[c] for c in cols))
             self._local.conn.commit()
         return True
+
+    def latest_metrics(self, script_path, exclude_id=None):
+        """同一用例**最近一条**度量（变更归因 / 指纹对比的基线）。
+
+        返回 dict（id / started_at / script_hash / rid_set / rid_set_hash /
+        app_version_name / app_version_code / duration_sec…）或 {}（无历史）。
+
+        为什么不从 cases 子表取：那里被 `drop_previous_cases` 删得只剩本次
+        （"同用例只留最新一条"策略），拿不到"上次"。本表 append-only → 能取到。
+        """
+        if not script_path:
+            return {}
+        sql = ("SELECT id, started_at, script_hash, rid_set, rid_set_hash,"
+               " app_version_name, app_version_code, duration_sec, device"
+               " FROM case_metrics WHERE script_path=?")
+        args = [script_path]
+        if exclude_id is not None:
+            sql += " AND id<>?"
+            args.append(exclude_id)
+        sql += " ORDER BY id DESC LIMIT 1"
+        with self._lock:
+            row = self._connect().execute(sql, args).fetchone()
+        if not row:
+            return {}
+        keys = ("id", "started_at", "script_hash", "rid_set", "rid_set_hash",
+                "app_version_name", "app_version_code", "duration_sec", "device")
+        return dict(zip(keys, row))
 
     def health_check(self, limit=100):
         """用例健康度聚合（与 flaky_stats / card_freshness 同层）。

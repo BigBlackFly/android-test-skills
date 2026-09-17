@@ -133,9 +133,13 @@ def _grep_storage(word, storage_dirs):
                 except (OSError, IOError):
                     continue
         # PNG 文件名语料（toast 截图证据文件名常含文案）
-        for fp in glob.glob(os.path.join(d, "**/*.png"), recursive=True):
-            if word in os.path.basename(fp):
-                return True
+        # ⚠️ 必须同时认 PNG / JPEG / WebP：截图默认已切 WebP（见
+        # test_framework.SHOT_FORMAT 的实测对比）。只认 .png 的后果不是"漏一条"，
+        # 而是**把有真机证据的断言判成"编造"**（假阳性 → 守门误杀）。
+        for _ext in ("png", "jpg", "jpeg", "webp"):
+            for fp in glob.glob(os.path.join(d, f"**/*.{_ext}"), recursive=True):
+                if word in os.path.basename(fp):
+                    return True
     return False
 
 

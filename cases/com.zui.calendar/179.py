@@ -273,12 +273,16 @@ def run():
     try:
         t.observe_dialogs(rounds=3)
         time.sleep(1.0)  # 等 toast 窗口稳定
-        # 实测（probe v2/v3/AB 隔离实验）：save_view bounds 中心 (1777,202) 点击无反应，
-        # +61,+31 偏移点 (1788,197) 稳定触发 toast —— 热区偏移，偏移量从 bounds 推导；
+        # 实测（probe v2/v3/AB 隔离实验）：save_view **bounds 中心**点击无反应，
+        # 需落在元素左上偏内处才稳定触发 toast（热区偏移）。
+        # ⚠️ 偏移不得写成设备像素常量（换设备/换 DPI 即失效，lint 规则 7 亦报）：
+        # 按元素**自身尺寸的 1/8** 派生 —— 标定机上 save_view ≈488×248，1/8 即
+        # 61/31，与当初实测一致；换设备按同比例落点，语义不变。
         # observe=False 必须带：默认点击链的弹窗检查窗口(~1.5s)+截图会占满 toast 的 ~2s 窗口
         b = t.el_bounds(rid="com.zui.calendar:id/save_view")
         if b:
-            t.tap_xy(b[0] + 61, b[1] + 31, observe=False)
+            w, h = b[2] - b[0], b[3] - b[1]
+            t.tap_xy(b[0] + w // 8, b[1] + h // 8, observe=False)
         else:
             t.tap_text("完成", wait=3, observe=False, silent=True)
         # 真实文案「课程时间有冲突，无法设置」来自探索期连拍记录（storage/179_toast_tap/v3_*.png），

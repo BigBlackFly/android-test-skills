@@ -13,6 +13,7 @@
   goto_图库导入_基本信息确认页(t)  空状态 → 图库导入完整链路 → 确认课程表基本信息页
   图库导入_选图到确认页(t)      入口之后的共享段：提示弹窗→权限→视觉选图→解析→确认页
   goto_手动创建课程表(t)          课程表空状态 → 手动创建页
+  open_新建课程(t)               空课表点空格 → 新建课程编辑页（App 改版后无加号中间态）
   tap_more_menu(t)              点顶栏「更多」并确认菜单弹出
   tap_rightmost_icon(t)         顶栏最右图标坐标（识别结果页禁用）
   top_bar_icons(t)              顶栏图标列表（调试辅助）
@@ -112,10 +113,12 @@ def tap_more_menu(t, retries=8):
         b = t.el_bounds(rid=RID_MORE)
         if b:
             t.tap_xy((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
-            time.sleep(1.2)
-            if any("课程表" in x for x in t.screen_text()):
+            # 等菜单项出现：原来是 sleep(1.2) + **单次** screen_text 判 —— 菜单慢
+            # 一点就假 FAIL。`wait_text_contains` 按子串等（菜单项文案是整句，
+            # wait_text 的精确匹配不适用），命中即停、上限仍是 1.2s。
+            if t.wait_text_contains("课程表", timeout=1.2):
                 return True
-        time.sleep(1.5)
+        time.sleep(1.5)          # 重试间隔（循环退避）
     return False
 
 
@@ -130,7 +133,24 @@ def _sleep(s=1.0):
     """settle 等待（非等 UI 元素）：固定值为真机调优结果，等待
     App 冷启动完成 / 页面转场 / PhotoPicker 渲染等无元素信号的 settle。
     等元素出现一律用 t.wait_rid / t.wait_text，不要往这里加 sleep。
-    保留理由见 SKILL.md 注意事项（既有链路 sleep 属 settle 型）。"""
+    保留理由见 SKILL.md 注意事项（既有链路 sleep 属 settle 型）。
+
+    ── 本文件 sleep 审计（P1a + 2026-09-16 真机轮）────────────────────
+    两轮共改 5 处（改成条件等待，`timeout` 取原 sleep 值 ⇒ 上限不变、只可能更快）：
+      · `test_camera` / `test_gallery` 的 14×0.7s 手写轮询 → `t.wait_activity`
+      · 「等表名输入框出现」`sleep(3)+el_bounds` → `t.wait_rid`
+      · `tap_more_menu` 的 `sleep(1.2)+单次 screen_text` → `wait_text_contains`
+      · 建表入口二选一的 `sleep(2)+el_bounds` → `wait_rid` 两次（上限仍是 2s）
+      · 权限被拒分支的 `sleep(3)+单次读屏` × 2 → `wait_text_any_contains`
+        （多候选共享一个预算 —— 这是新增的框架能力，专治"OR 条件等不了"）
+
+    剩余 13 处**刻意保留**，三类原因（用 `evals/audit_waits.py` 逐条核过）：
+      ① 无元素信号可等：进程退出 / 冷启动首帧 / 惯性滚动 / 页面转场；
+      ② **等"值变化"而非"元素出现"**：拨滚轮后读值、改 RadioGroup 后读行内值
+         （`wait_*` 只认出现/消失，表达不了"值变了"）；
+      ③ `dismiss_*` / `observe_dialogs` 之前的 settle —— 它们自带等待，但**等的
+         是另一个条件**（弹窗 vs 主界面），属 `audit_waits` 的"需人判"。
+    复核命令：`python evals/audit_waits.py cases/com.zui.calendar/_flow.py`"""
     time.sleep(s)
 
 
@@ -266,6 +286,42 @@ def goto_手动创建课程表(t, pm_clear=True, skip_if_ready=None):
         return False
     _sleep(3)
     return True
+
+
+# ── 空课表周视图 → 新建课程编辑页（2026-09-17 探针实测的改版）─────────────
+CV_EMPTY = "com.zui.calendar:id/cv_empty_content"
+ET_COURSE_NAME = "com.zui.calendar:id/etCourseName"
+
+
+def open_新建课程(t, attempts=3, per_try=3, cell_rid=None):
+    """空课表周视图点空格 → 新建课程编辑页（EditCourseActivity）。返回是否成功。
+
+    ⚠️ **App 已改版（2026-09-17 探针实测，见 `evals/probe_addhint.py`）**：
+    旧链路是「点空格 → 出现加号浮标 `iv_add_hint` → 再点加号 → 编辑页」；
+    现在中间的 `iv_add_hint` **已彻底移除**（点空格后连续 4 次 dump 都无该节点），
+    而且**第一次点击空格会被"吸收"**（0.3 / 1.0 / 2.5 / 5.5s 四次 dump 的 UI 树
+    完全没变，连节点集合都一模一样），**第二次点击**才进编辑页。
+
+    → 这正是 176 / 182 在 2026-09-16 全量套件里 FAIL（"点空格后加号 iv_add_hint
+      未出现"）的真因：用例卡在"等加号"那一步，永远走不到第二次点击。
+      （同轮框架的指纹检测器已报 `[WARN] 版本未变但界面已变` → App 侧 config 改版。）
+
+    为什么是"点一次不行再点一次"、而不是"直接连点两次"：只点一次就能打开编辑页的
+    版本（或将来改回去）不该挨多出来的第二下（会落到编辑页的课程名输入框附近，
+    可能误开键盘）。循环里**每次点击后都先等编辑页**，命中即停。
+    """
+    cell_rid = cell_rid or CV_EMPTY
+    short = cell_rid.split("/")[-1]
+    for _ in range(attempts):
+        b = t.el_bounds(rid=cell_rid)
+        if not b:
+            t.record("FAIL", "空课表看不到空格子(%s)，无法进入新建课程" % short)
+            return False
+        t.tap_xy((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+        if t.wait_rid(ET_COURSE_NAME, timeout=per_try):
+            return True
+    t.record("FAIL", "点空格 %d 次仍未进入新建课程页（无 etCourseName）" % attempts)
+    return False
 
 
 def _on_确认页(t):
@@ -635,18 +691,23 @@ def test_camera(t, allow):
     t.tap_text("拍照导入课程表", silent=True)   # 失败由下方 Activity/文案断言兜底
     _dismiss_image_hint(t)          # 挡路框必须先关，否则相机不会被拉起
     if allow:
-        act = ""
-        for _ in range(14):
-            time.sleep(0.7)
-            act = t.current_activity()
-            if "camera" in act.lower():
-                break
+        # 手写轮询（14×0.7s 轮询 current_activity）→ 改用框架 wait_activity：
+        # 命中即停、超时有界，且计入 RunMetrics 的等待统计（§7.1）。
+        # 超时后再读一次真实 activity，让失败信息带现场（而不是空串）。
+        act = t.wait_activity("camera", timeout=10)
+        if not act:
+            try:
+                act = t.current_activity()
+            except Exception:
+                act = ""
         ok = "camera" in act.lower() or "zui.camera" in act.lower()
         t.record("PASS" if ok else "FAIL",
                  f"允许后相机打开: {act}")
         t.screenshot("相机_允许")
     else:
-        time.sleep(3)
+        # 等"拒绝后果"文案（两候选共享 3s 预算）—— 原来是 sleep(3) + **单次**读屏：
+        # 系统弹窗慢一点就假 FAIL，快一点就白等。上限不变，命中即停。
+        t.wait_text_any_contains(("相机权限", "前往设置"), timeout=3)
         texts = t.screen_text()
         denied = any("相机权限" in x for x in texts) or any("前往设置" in x for x in texts)
         t.record("PASS" if denied else "FAIL",
@@ -660,18 +721,21 @@ def test_gallery(t, allow):
     t.tap_text("从图库导入课程表", silent=True)  # 失败由下方 Activity/文案断言兜底
     _dismiss_image_hint(t)          # 挡路框必须先关，否则相册不会被拉起
     if allow:
-        act = ""
-        for _ in range(14):
-            time.sleep(0.7)
-            act = t.current_activity()
-            if "photopicker" in act.lower():
-                break
+        # 同 test_camera：手写轮询 → wait_activity（命中即停 + 等待计入 RunMetrics）
+        act = t.wait_activity("photopicker", timeout=10)
+        if not act:
+            try:
+                act = t.current_activity()
+            except Exception:
+                act = ""
         ok = "photopicker" in act.lower() or "PhotoPicker" in act
         t.record("PASS" if ok else "FAIL",
                  f"允许后进入照片选择界面: {act}")
         t.screenshot("图库_允许")
     else:
-        time.sleep(3)
+        # 同上：`权限` 先出现（标题），`前往设置` 后出现（按钮）→ 第一个满足即停，
+        # 后面那句 `and` 断言再读一次屏兜住第二个条件。
+        t.wait_text_any_contains(("前往设置", "权限"), timeout=3)
         texts = t.screen_text()
         denied = any("权限" in x for x in texts) and any("前往设置" in x for x in texts)
         t.record("PASS" if denied else "FAIL",
@@ -734,13 +798,19 @@ def ensure_two_tables(t, want=2, max_new=3):
             return names
         if not t.tap_rid(RID_TABLE_SETTINGS, silent=True):
             t.el_bounds(rid=RID_EMPTY_VIEW)          # 空状态页：原地即可
-        time.sleep(2)
+        # 等"可点入口"出现（两者任一）再决定点哪个。原来是 sleep(2) 后 el_bounds
+        # 二选一 —— 页面慢一点就会**选错入口**（落进 fallback 分支去点
+        # `action_add_schedule`），比多等一秒危险得多。
+        # 上限不变（1+1=2s），命中即停。
+        if not t.wait_rid(RID_CREATE_MANUALLY, timeout=1):
+            t.wait_rid(RID_ADD_SCHEDULE, timeout=1)
         entry = (RID_CREATE_MANUALLY
                  if t.el_bounds(rid=RID_CREATE_MANUALLY) else RID_ADD_SCHEDULE)
         if not t.tap_rid(entry, silent=True):
             return table_names(t)                    # 进不去新建页 → 交用例报 BLOCKED
-        time.sleep(3)
-        if not t.el_bounds(rid=RID_ET_TABLE_NAME):
+        # 等表名输入框出现：rid 是**精确匹配**，故 wait_rid 与原来的
+        # sleep(3)+el_bounds 语义等价，但命中即停（正常时省下这段固定等待）。
+        if not t.wait_rid(RID_ET_TABLE_NAME, timeout=3):
             return table_names(t)
         # 表名必须**全局唯一**：用 len(names) 编号会在"列表读取滞后/上次残留"
         # 时造出重名表 → 用例按名字区分"当前/非当前"时判错（实测 186 因此

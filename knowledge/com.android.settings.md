@@ -4,6 +4,8 @@
 
 - **app**: `com.android.settings`
 - **name**: 系统设置 / ZUI Settings
+- **验证版本**: 18.5.0.0166（versionName，2026-09-16 真机采集）
+- **versionCode**: 18500166（2026-09-16 真机采集，TB323FU / Android 17）
 - **最近验证**: 2026-09-09（双栏布局、deep link、导航条目属性 实测）
 
 ## 检索索引

@@ -4,6 +4,7 @@ Android GUI 测试框架：元素操作、断言、截图、Toast 捕捉、置�
 依赖: Python 3.10+（str | None 语法）+ uiautomator2 + rapidocr_onnxruntime
 """
 import io
+import json
 import os
 import re
 import shutil
@@ -182,6 +183,35 @@ class CaseAbort(Exception):
     run_case.py 捕获后仍会生成报告，退出码按 FAIL（1）处理。"""
 
 
+class PartialRun(Exception):
+    """`--stop-after N`：到达步数上限，**主动**提前收尾（不是失败）。
+
+    与 CaseAbort 的区别在**语义与后果**（两者都会被 run_case 捕获）：
+
+    | | 含义 | 结论 | 退出码 | 入库 |
+    |---|---|---|---|---|
+    | `CaseAbort` | 必需操作失败 | FAIL | 1 | 是 |
+    | `PartialRun` | 本次只跑前 N 步 | 按已跑部分正常算 | **0** | **否** |
+
+    用途是 edit-run 调试循环（改一点、验一点）。局部执行**不入库**：只跑了前
+    N 步的 "PASS" 会误导记录库，也会污染 flaky 统计（§八 P1a 明确"不计入
+    flaky"）。退出码 0 是为了能在 shell 里用 `&&` 串起来。
+    """
+
+
+class CaseBlocked(CaseAbort):
+    """前置条件不满足 → 结论 **BLOCKED**、退出码 **2**（不是 FAIL）。
+
+    为什么需要独立的异常类型：`require_*` 找不到元素有两种完全不同的成因 ——
+    ① App 真的坏了（缺陷）；② 前置条件缺失（配置未命中 / 数据没准备 / 换设备后
+    布局不同）。两者记成同一个 FAIL，缺陷库就被"环境噪音"污染，且验收 12 的
+    "配置差异除外"永远无法机械判定（§2.2 / §10.3）。
+
+    继承 CaseAbort 是为了复用"中止用例 + 照常出报告"的既有路径；退出码不再由
+    run_case 硬编码，而是用它记录的结果（BLOCKED）映射为 2。
+    """
+
+
 class ExecutionTimeCacheError(CaseAbort):
     """执行期误用缓存 API —— 必须 raise 阻断，否则拿过期数据当结论 = 假 PASS。
 
@@ -189,6 +219,102 @@ class ExecutionTimeCacheError(CaseAbort):
     报告正常出；RuntimeError 会被 run_case 当 `_fatal_error` → 结论压成 ERROR、
     退出码 3，报告还会写"执行异常终止，结论不可信"。
     """
+
+
+def _rid_candidates(nodes, rid):
+    """收集与 rid 匹配的候选节点。返回 (候选列表, 形态)。
+
+    形态：`exact` = rid 完全相等；`local` = 只匹配 `:id/` 后的本地名（兼容
+    某些 dump 不回包名前缀的机型）；`miss` = 都不匹配。
+    **先精确再兼容**：本地名匹配放在第二级，避免跨包同名节点抢先命中。
+    """
+    exact = [n for n in nodes if n.get("rid") == rid]
+    if exact:
+        return exact, "exact"
+    if ":" in (rid or ""):
+        local = rid.split("/")[-1]
+        approx = [n for n in nodes if n.get("rid") == local]
+        if approx:
+            return approx, "local"
+    return [], "miss"
+
+
+def _pick_rid_node(vis):
+    """从**多个同 rid 且有 bounds** 的节点里选最可能是目标的那个。
+
+    返回 (node, ambiguous)。为什么需要它：Android 里同一 rid 常同时挂在
+    **容器与子控件**上（`id/item` 出现在列表项根和它的文本上），此时"取树序
+    第一个"很可能点到容器（点容器可能被拦截或点错位置）。
+
+    判据顺序（对 §4.2 的落实）：
+      ① 只有一个 → 是它
+      ② 优先 `clickable=true`（rid 定位的目的绝大多数是点击/取值）
+      ③ 仍多个 → 取**面积最小**的（容器通常更大、更"外"）
+      ④ 仍并列 → 取树序第一个，但标 **ambiguous**（暴露歧义，绝不静默）
+    """
+    if not vis:
+        return None, False
+    if len(vis) == 1:
+        return vis[0], False
+    clickable = [n for n in vis if n.get("clickable") == "true"]
+    pool = clickable or vis
+    if len(pool) == 1:
+        return pool[0], False
+
+    def _area(n):
+        b = n["bounds_xy"]
+        return abs(b[2] - b[0]) * abs(b[3] - b[1])
+
+    pool = sorted(pool, key=_area)
+    amb = len(pool) > 1 and _area(pool[0]) == _area(pool[1])
+    return pool[0], amb
+
+
+def _priority_match(nodes, rid=None, desc=None, text=None):
+    """按 **rid → desc → text** 优先级在同一份节点列表里取命中节点。
+
+    与旧实现（同一循环里 OR、按树序返回）的差别是**语义**：OR 写法下
+    `tap_el(rid=R, text=T)` 可能点到树上更靠前、`text==T` 的**无关节点**
+    —— SKILL.md 约定的 rid > desc > text 优先级形同虚设（实为潜在误点）。
+
+    §4.2 硬约束「只允许在同一个 dump 内降级」由本函数天然满足：nodes 来自
+    **一次** dump，三级降级在同一份树上完成，不存在"跨 dump 重找 → 元素身份
+    保证断裂"。
+
+    返回 `(node, layer, status)`：
+
+    | status | 含义 | 调用方该做什么 |
+    |---|---|---|
+    | `hit` | rid 精确命中且节点可用 | 直接用 |
+    | `ambiguous` | rid 命中多个且无法区分（同面积） | 已按 ②③ 取最具体那个，**留痕** |
+    | `present_no_bounds` | **rid 在树上存在但没有 bounds** | **绝不降级**，见下 |
+    | `fallback` | rid 未命中，靠 desc/text 命中 | 留痕（OTA 漂移信号） |
+    | `miss` | 都没命中 | 按"找不到"处理 |
+
+    **`present_no_bounds` 是本函数最重要的一条设计**：rid 存在但 bounds 为空
+    意味着元素被折叠/出屏/未布局（§2.4 归因②「没滚到」），此时正确答案是
+    **滚动或报找不到**，而**不是**退到 text 去匹配 —— 那会命中一个同名乱入的
+    无关节点，进而"成功"点到错的东西（**比找不到更危险**：报告还是绿的）。
+    """
+    if rid:
+        cands, _form = _rid_candidates(nodes, rid)
+        vis = [n for n in cands if n.get("bounds_xy")]
+        if vis:
+            node, amb = _pick_rid_node(vis)
+            return node, "rid", ("ambiguous" if amb else "hit")
+        if cands:
+            # rid 找到了、但全都没有 bounds → 存在但不可用，禁止降级
+            return None, "rid", "present_no_bounds"
+
+    if desc:
+        for n in nodes:
+            if n.get("desc") == desc and n.get("bounds_xy"):
+                return n, "desc", ("fallback" if rid else "hit")
+    if text:
+        for n in nodes:
+            if n.get("text") == text and n.get("bounds_xy"):
+                return n, "text", ("fallback" if rid else "hit")
+    return None, None, "miss"
 
 
 class _Located:
@@ -415,6 +541,19 @@ class TestCase:
         self._shot_idx = 0
         self._ocr = None
         self._dump_count = 0
+        # ── RunMetrics 运行期计数（P0a，plan §7.1）────────────────────────
+        # 全部用 getattr 惰性补齐：单测用 object.__new__ 绕过 __init__。
+        self._wait_calls = 0      # wait_* 调用次数
+        self._wait_sec = 0.0      # wait_* 累计等待（"等到就停"的实测值）
+        self._rid_seen = set()    # 本轮见过的 rid 集合（指纹基线，§4.1 信号 2）
+        # --stop-after N：只跑前 N 步（edit-run 调试循环）。None = 不限制。
+        # 值非法按"不限制"处理：调试开关不该因一个笔误把用例彻底卡死。
+        # （命令行侧的取值校验在 run_case._parse_stop_after，非法值在那里就退出了）
+        try:
+            _sa = os.environ.get("DSH_STOP_AFTER")
+            self._stop_after = int(_sa) if _sa else None
+        except ValueError:
+            self._stop_after = None
         # 采集会话档案：TraceRecorder 独立模块承担落盘，TestCase 只做委托
         # （set_trace 开启后 dump 快照全落盘 + events.jsonl + index.json）
         # ⚠️ 必须在 _maybe_auto_trace() **之前**创建：那个方法会调用
@@ -450,7 +589,10 @@ class TestCase:
         #   - 无 script_path（直接跑临时脚本）→ 不入库
         # 旧规则用名称前缀（PROBE_/RECON_）判定，被中文临时脚本名绕过 →
         # 实测混入 13 条脏记录。详见 _should_record 的说明。
-        if self.script_path and _should_record(self.user_input, self.name):
+        # --stop-after 局部执行**不入库**：只跑了前 N 步的 "PASS" 会误导记录库，
+        # 也会污染 flaky 统计（§八 P1a 明确"不计入 flaky"）。
+        if (self.script_path and _should_record(self.user_input, self.name)
+                and self._stop_after is None):
             try:
                 from db import get_db
                 self._db = get_db()
@@ -566,6 +708,12 @@ class TestCase:
             self.trace = TraceRecorder(STORAGE_DIR)
         self._dump_count += 1
         xml = self.d.dump_hierarchy()
+        # 每次都更新"最近一份 dump"快照：`dump_snapshot()` 与失败工件包（§5）
+        # 都靠它。**不在这里更新的话工件包里永远没有 dump.xml** —— 而"失败
+        # 那一刻的 UI 树"正是工件包最有价值的产出（2026-09-16 真机实测：
+        # BLOCKED 现场只有 state.json + 截图，dump 缺失）。
+        # 只保留一份：XML 可能 ~1MB，留着旧的没有价值（要的就是"当时"）。
+        self._snap = (time.time(), xml)
         self.trace.snapshot(xml, src=_dump_call_src())
         return xml
 
@@ -907,7 +1055,15 @@ class TestCase:
     # ── 步骤管理 ────────────────────────────────────────────────────
     def step(self, name):
         """开启一个步骤，返回 self（支持 with 或直接调用）"""
+        stop_after = getattr(self, "_stop_after", None)
+        if stop_after is not None and len(self.steps) >= stop_after:
+            # 已跑满 N 步 → 不开新步骤，主动收尾（语义见 PartialRun）。
+            # record 落在第 N 步里：报告里能看见"为什么提前结束"。
+            self.record("INFO", f"--stop-after {stop_after}：已执行前 {stop_after} 步"
+                                "，提前收尾（局部执行，退出码 0、不入库）")
+            raise PartialRun(f"--stop-after {stop_after}：只执行前 {stop_after} 步")
         self._cur_step = {"name": name, "results": [], "evidences": []}
+        self._shot_in_step = 0     # M3：每步截图配额从这里重新计
         self.steps.append(self._cur_step)
         if self._db is not None and self._db_case_id is not None:
             try:
@@ -971,7 +1127,149 @@ class TestCase:
         if entry.get("state"):
             print(f"   📊 状态 {entry['state']}")
         # 证据路径已由 _auto_screenshot 内部打印，避免重复输出
+        # ── 失败工件包（§五）：在 **record(FAIL/BLOCKED) 这一刻**抓现场 ──
+        # 不放到 finish()：那时页面可能已经变了（甚至已回桌面），dump 说明不了
+        # 失败现场。取样源是 _snap（最近一份 dump 快照）= "当时那份 XML"。
+        if result in ("FAIL", "BLOCKED") and not getattr(self, "_in_probe_page", False):
+            self._write_failure_bundle(detail)
         return result == "PASS"
+
+    def _write_failure_bundle(self, detail):
+        """失败工件包（§五，对标 Playwright on-fail 三件套）。
+
+        三件：① 当时那份 dump XML；② 失败截图（force，不受 M3 每步配额限制）；
+        ③ state JSON（前台包 / Activity / rotation / 降级事件）。
+
+        **数据敏感性**：dump XML 含界面文本（日程内容、姓名等），仅供**本地排查**、
+        不外发报告；需要外发时须先脱敏（§五）。
+        """
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            idx = getattr(self, "_fail_idx", 0) + 1
+            self._fail_idx = idx
+            d = os.path.join(self.case_dir, f"失败现场_{idx:02d}_{ts}")
+            os.makedirs(d, exist_ok=True)
+
+            # ① dump XML（当时那份快照；没有快照则明说，不假装有）
+            snap = getattr(self, "_snap", None)
+            xml = snap[1] if snap else None
+            if xml:
+                with open(os.path.join(d, "dump.xml"), "w",
+                          encoding="utf-8") as f:
+                    f.write(xml)
+
+            # ② 截图（force=True：失败现场永远要留）
+            # 截图先落在 case_dir（与报告的证据列表一致），**再复制一份进包内**：
+            # 工件包要能独立拷走给人看，只给个相对文件名等于还得回头找。
+            shot = None
+            try:
+                shot = self._auto_screenshot(f"失败_{idx:02d}", force=True)
+                if shot and os.path.isfile(shot):
+                    import shutil as _sh
+                    _sh.copy2(shot, os.path.join(d, os.path.basename(shot)))
+            except Exception:
+                pass
+
+            # ③ state JSON
+            def _safe(fn, default=None):
+                try:
+                    return fn()
+                except Exception:
+                    return default
+
+            state = {
+                "time": ts,
+                "detail": detail,
+                "step": (self._cur_step or {}).get("name"),
+                "package": _safe(self.current_package),
+                "activity": _safe(self.current_activity),
+                "rotation": _safe(lambda: self.adb_shell(
+                    "settings", "get", "system", "user_rotation")),
+                "has_dump": bool(xml),
+                "screenshot": os.path.basename(shot) if shot else None,
+                "healing": [v for v in (getattr(self, "_healing", None) or {}).values()],
+            }
+            with open(os.path.join(d, "state.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            print(f"   📦 失败现场已打包: {os.path.basename(d)}/")
+            return d
+        except Exception as e:
+            print(f"⚠️ [失败工件包] 落盘失败（不影响结论）: {e}")
+            return None
+
+    # ── 自愈留痕 / Locator Memory（P5 §4.2）─────────────────────────
+    def _write_healing_log(self):
+        """把本轮的降级记录并入 `healing_log.json`（per App）。
+
+        · 键为 **(activity, rid)**：同 App 多页面常有同名 rid（`btn_ok` /
+          `id_save`），仅用 rid 会串页。
+        · **APK 真的变了（归因码 apk）→ 清空该 App 全部记录**：rid 可能真变了，
+          旧 fallback 不再可信（§4.2「版本门禁触发 WARN 时清除 healing 记录」）。
+        · 累计 count ≥3 → 生成知识卡更新提案：这比版本号比对**更精确**的漂移信号
+          （版本号可能没动，但定位已连续失效）。
+        """
+        h = getattr(self, "_healing", None)
+        if not h:
+            return None
+        try:
+            pkg = self._case_package_from_script() or "unknown"
+            path = os.path.join(STORAGE_DIR, "healing", f"{pkg}.json")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            data = {}
+            if os.path.isfile(path):
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        data = json.load(f) or {}
+                except Exception:
+                    data = {}
+            if getattr(self, "_attribution_code", None) == "apk":
+                # 版本真的换了：保留计数没意义，fallback 的"身份保证"已断
+                n = len(data)
+                data = {}
+                print(f"   🧹 APK 已变化 → 清除 {pkg} 的 {n} 条降级记录"
+                      "（rid 可能真变了，旧 fallback 不可信）")
+            for (act, rid), rec in h.items():
+                key = f"{act}|{rid}"
+                old = data.get(key) or {}
+                data[key] = {
+                    "activity": act, "rid": rid,
+                    "layer": rec["layer"], "fallback": rec["fallback"],
+                    "count": int(old.get("count", 0)) + rec["count"],
+                    "last_seen": datetime.now().strftime("%Y-%m-%d"),
+                }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            hits = sum(v["count"] for v in h.values())
+            print(f"   🩹 本次定位降级 {hits} 次（{len(h)} 个目标）→ "
+                  f"{os.path.basename(path)}")
+            props = [v for v in data.values() if v["count"] >= 3]
+            if props:
+                self._write_card_proposals(pkg, props)
+            return path
+        except Exception as e:
+            print(f"⚠️ [healing] 落盘失败: {e}")
+            return None
+
+    def _write_card_proposals(self, pkg, props):
+        """count ≥3 的降级目标 → 知识卡更新提案（§4.2）。"""
+        p = os.path.join(STORAGE_DIR, "healing", f"{pkg}_知识卡更新提案.md")
+        lines = [
+            f"# {pkg} 知识卡更新提案（自动生成）", "",
+            f"> 生成时间：{datetime.now():%Y-%m-%d %H:%M}",
+            "> 判据：同一 (Activity, rid) 降级命中累计 **≥3 次**。",
+            "> 这是比版本号比对**更精确**的 OTA 漂移信号 —— 版本号可能没变，",
+            "> 但 rid 定位已连续失效（§4.2）。", "",
+        ]
+        for r in sorted(props, key=lambda x: -x["count"]):
+            lines.append(
+                f"- `{r['rid']}`（{r['activity'] or '未知页面'}）：rid 连续找不到，"
+                f"实际靠 `{r['fallback']}` 命中 **{r['count']} 次**"
+                f"（层级 `{r['layer']}`，最近 {r['last_seen']}）")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"   📝 知识卡更新提案已生成: {os.path.basename(p)}"
+              f"（{len(props)} 条 rid 连续降级）")
 
     def blocked(self, reason):
         """环境/前置不满足，无法执行"""
@@ -1070,17 +1368,181 @@ class TestCase:
             time.sleep(0.4)
         return ""
 
-    def el_bounds(self, rid=None, text=None, desc=None, xpath=None):
-        """按 资源id/文字/内容描述/xpath 定位元素，返回 bounds (x1,y1,x2,y2) 或 None"""
-        xml = self._dump()
-        self._run_dialog_watchers(xml)
-        for n in _parse_nodes(xml):
-            ok = (rid and n["rid"] == rid) \
-                or (text and n["text"] == text) \
-                or (desc and n["desc"] == desc)
-            if ok and n["bounds_xy"]:
-                return n["bounds_xy"]
-        return None
+    def el_bounds(self, rid=None, text=None, desc=None, xpath=None, xml=None):
+        """按 资源id / 内容描述 / 文字 定位元素，返回 bounds (x1,y1,x2,y2) 或 None。
+
+        **优先级 rid > desc > text**（SKILL.md 约定），三级在**同一份 dump** 内
+        完成（§4.2 硬约束，见 _priority_match）。
+
+        xml：复用一份快照查多个目标时传入（传了就不再 dump，§7.2 M4）。
+        降级命中（给了 rid 却靠 desc/text 命中）会留痕 —— 那是 OTA 漂移的精确
+        信号（§4.2 / P5）。
+        """
+        if xml is None:
+            xml = self._dump()
+            self._run_dialog_watchers(xml)
+        nodes = _parse_nodes(xml)
+        self._note_rids(nodes)          # 指纹基线（§4.1 信号 2 / §7.1）
+        n, layer, status = _priority_match(nodes, rid=rid, desc=desc, text=text)
+        if status == "present_no_bounds":
+            # rid 在树上但不可交互（出屏/折叠/未布局）→ 这是「没滚到」，不是
+            # 「改名了」。**绝不降级**去匹配 desc/text（详见 _priority_match）。
+            self._note_no_bounds(rid)
+            return None
+        if n is not None and status in ("fallback", "ambiguous"):
+            self._note_healing(rid or layer, layer, desc=desc, text=text,
+                               kind=status)
+        return n["bounds_xy"] if n else None
+
+    def _note_no_bounds(self, rid):
+        """记一次「rid 存在但无 bounds」（出屏 / 折叠 / 未布局）。
+
+        与"降级"是**两件事**，必须分开：
+          · 降级 = rid 没了（改名/重构）→ 归因 OTA 漂移，落 healing_log
+          · 无 bounds = rid 还在但不可见 → 多半要**滚动**（`scroll_to_rid`）
+
+        混在一起会诱导"该滚的时候去猜 text"，而那会点到无关节点。同一 rid
+        反复出现即提示"这条链路该改用 scroll_to_rid"。
+        """
+        memo = getattr(self, "_nobounds", None)
+        if memo is None:
+            memo = {}
+            self._nobounds = memo
+        memo[rid] = memo.get(rid, 0) + 1
+        if memo[rid] <= 2:
+            # 只前两次提示：轮询里每次都走到这，刷屏会掩盖真信号
+            print(f"   ↕️ {rid}: 在 UI 树上但无可交互 bounds（出屏/折叠）"
+                  " → 需要滚动；不降级匹配 text")
+
+    def _note_healing(self, rid, layer, desc=None, text=None, kind="fallback"):
+        """记一次定位降级（P5 §4.2）。
+
+        按 **(activity, rid)** 聚合计数 —— 不用仅 rid：同 App 多页面常有同名
+        rid（`btn_ok` / `id_save`），仅用 rid 会串页。
+
+        ⚠️ 性能：`current_activity()` 是一次 dumpsys，不能进轮询热路径。故对
+        (rid, layer) 只取**一次** activity 并记忆，之后仅计数（降级发生在这里
+        说明 rid 已失效，一次 dumpsys 的代价可接受）。
+        """
+        memo = getattr(self, "_healing_act", None)
+        if memo is None:
+            memo = {}
+            self._healing_act = memo
+        sk = (rid, layer)
+        act = memo.get(sk)
+        if act is None:
+            try:
+                act = self.current_activity() or ""
+            except Exception:
+                act = ""
+            memo[sk] = act
+        h = getattr(self, "_healing", None)
+        if h is None:
+            h = {}
+            self._healing = h
+        rec = h.get((act, rid))
+        if rec is None:
+            rec = {"activity": act, "rid": rid, "layer": layer,
+                   "kind": kind,          # fallback（rid 没了）/ ambiguous（多个）
+                   "fallback": (f"desc={desc}" if layer == "desc"
+                                else f"text={text}"),
+                   "count": 0}
+            h[(act, rid)] = rec
+        rec["count"] += 1
+        return rec
+
+    # ── RunMetrics 辅助（P0a）──────────────────────────────────────────
+    def _note_rids(self, nodes):
+        """累计本轮见过的 rid（元素集合指纹的原始数据，§4.1 信号 2 / §7.1）。
+
+        惰性补齐属性：单测用 object.__new__ 绕过 __init__ 时属性可能不存在。
+        取的是**本轮并集**而非"某一次 settled dump"——按 Activity 分组的精确口径
+        待 settled 检测立项后启用（见 §4.1 信号 2 的"计算口径"）。
+        """
+        try:
+            seen = getattr(self, "_rid_seen", None)
+            if seen is None:
+                seen = set()
+                self._rid_seen = seen
+            for n in nodes:
+                rid = n.get("rid")
+                if rid:
+                    seen.add(rid)
+        except Exception:
+            pass
+
+    def _note_wait(self, elapsed):
+        """累计 wait_* 次数与时长（§7.1「等待」维度）。
+
+        与 lint 静态求和（sleep_static_sec）互补、不可互替：那个只算 case 源码里
+        的**固定** `time.sleep(字面量)`（下界）；这里是 wait_* 的"命中即停"实测值。
+        """
+        try:
+            self._wait_calls = getattr(self, "_wait_calls", 0) + 1
+            self._wait_sec = round(
+                getattr(self, "_wait_sec", 0.0) + max(0.0, elapsed), 3)
+        except Exception:
+            pass
+
+    def _count_screenshots(self):
+        """本轮截图张数 / 总字节（M3 口径）。
+
+        直接量产物目录而不是埋点计数：截图有 4 条写入路径（step/动作/验证点/
+        capture_toast），逐个埋点容易漏一个；目录是唯一的真实结果。
+        """
+        n = total = 0
+        try:
+            case_dir = getattr(self, "case_dir", None)
+            if not case_dir or not os.path.isdir(case_dir):
+                return 0, 0
+            for name in os.listdir(case_dir):
+                # 同时计 PNG / JPEG / WebP（编码格式见 SHOT_FORMAT；只认 .png 会
+                # 让"换了编码"之后 M3 统计直接归零 —— 指标静默失效）
+                if not name.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                    continue
+                p = os.path.join(case_dir, name)
+                if os.path.isfile(p):
+                    n += 1
+                    total += os.path.getsize(p)
+        except Exception:
+            pass
+        return n, total
+
+    def _run_metrics_extra(self):
+        """RunMetrics 增量列（P0a，plan §7.1）：静态指标 + 运行期计数。
+
+        静态部分（脚本 hash / sleep 静态和 / 守门计数）由 run_case 经环境变量
+        传入——run_case 与 TestCase 处在不同阶段，实例上拿不到；运行期部分
+        （等待 / 截图 / rid 集合）在这里现算。任何一环失败都退化成"少记几列"，
+        绝不影响基础记录（耗时/结果）。
+        """
+        try:
+            import json
+            import run_metrics as _rm
+        except Exception:
+            return {}
+        try:
+            extra = dict(_rm.load_static() or {})
+            shots, shot_bytes = self._count_screenshots()
+            rids = sorted(getattr(self, "_rid_seen", None) or ())
+            extra.update({
+                "package": self._case_package_from_script(),
+                "wait_calls": getattr(self, "_wait_calls", None),
+                "wait_sec": getattr(self, "_wait_sec", None),
+                "screenshots": shots,
+                "screenshot_bytes": shot_bytes,
+                # 完整 rid 集合而非只存 hash：报告要输出"新增/消失的 rid"明细
+                # （§10.2），只有 hash 判得出"变了没变"、判不出"哪些变了"。
+                "rid_set": json.dumps(rids, ensure_ascii=False) if rids else None,
+                "rid_set_hash": _rm.rid_set_hash(rids),
+                # P5：自愈/降级命中次数（§7.1「质量」维度）
+                "healing_hits": (sum(v["count"] for v in
+                                     (getattr(self, "_healing", None) or {}).values())
+                                 or None),
+            })
+            return _rm.sanitize_extra(extra)
+        except Exception:
+            return {}
 
     def tap_el(self, rid=None, text=None, desc=None, xpath=None, wait=5.0,
                observe=True, silent=False):
@@ -1146,27 +1608,66 @@ class TestCase:
     # 实现统一为"轮询内直接点击"（tap_* 的 silent 模式）：旧实现"先 wait 后 tap"
     # 两步之间存在竞态窗口（wait 命中后元素消失 → tap 降级 WARN 或裸崩），
     # 与"必需操作失败 = FAIL 中止"的契约冲突。
-    def require_tap_text(self, text, wait=8.0, msg=None):
-        """必须点到指定文字的元素；等不到记 FAIL 并抛 CaseAbort 中止用例。"""
+    def _require_absent(self, detail, on_absent, exc_msg):
+        """require_* 失败时的统一收口：记 FAIL 或 BLOCKED，再抛对应异常。
+
+        `on_absent="BLOCKED"` 用于**前置条件类**的必需元素（配置未命中 / 数据未
+        准备 / 换设备布局不同）：记 BLOCKED → 退出码 2，不污染缺陷库（§10.3）。
+        """
+        if str(on_absent).upper() == "BLOCKED":
+            self.record("BLOCKED", detail)
+            raise CaseBlocked(exc_msg)
+        self.record("FAIL", detail)
+        raise CaseAbort(exc_msg)
+
+    def require_tap_text(self, text, wait=8.0, msg=None, on_absent="FAIL"):
+        """必须点到指定文字的元素；等不到记 FAIL 并抛 CaseAbort 中止用例。
+        on_absent="BLOCKED" → 记为阻塞（退出码 2），用于前置条件类元素。"""
         if not self.tap_text(text, wait=wait, silent=True):
-            self.record("FAIL", msg or f"必需元素未出现: text={text!r}，用例中止")
-            raise CaseAbort(f"require_tap_text({text!r}) 超时")
+            self._require_absent(msg or f"必需元素未出现: text={text!r}，用例中止",
+                                 on_absent, f"require_tap_text({text!r}) 超时")
         return True
 
-    def require_tap_rid(self, rid, wait=8.0, msg=None):
-        """必须点到指定 resource-id 的元素；等不到记 FAIL 并抛 CaseAbort。"""
+    def require_tap_rid(self, rid, wait=8.0, msg=None, on_absent="FAIL"):
+        """必须点到指定 resource-id 的元素；等不到记 FAIL 并抛 CaseAbort。
+        on_absent="BLOCKED" → 记为阻塞（退出码 2）。"""
         if not self.tap_rid(rid, wait=wait, silent=True):
-            self.record("FAIL", msg or f"必需元素未出现: rid={rid!r}，用例中止")
-            raise CaseAbort(f"require_tap_rid({rid!r}) 超时")
+            self._require_absent(msg or f"必需元素未出现: rid={rid!r}，用例中止",
+                                 on_absent, f"require_tap_rid({rid!r}) 超时")
         return True
 
-    def require_tap_el(self, rid=None, text=None, desc=None, wait=8.0, msg=None):
-        """必须点到元素（rid/text/desc 任一）；等不到记 FAIL 并抛 CaseAbort。"""
+    def require_tap_el(self, rid=None, text=None, desc=None, wait=8.0, msg=None,
+                       on_absent="FAIL"):
+        """必须点到元素（rid/text/desc 任一）；等不到记 FAIL 并抛 CaseAbort。
+        on_absent="BLOCKED" → 记为阻塞（退出码 2）。"""
         if not self.tap_el(rid=rid, text=text, desc=desc, wait=wait, silent=True):
-            self.record("FAIL", msg
-                        or f"必需元素未出现: rid={rid} text={text} desc={desc}，用例中止")
-            raise CaseAbort(f"require_tap_el({rid or text or desc!r}) 超时")
+            self._require_absent(
+                msg or f"必需元素未出现: rid={rid} text={text} desc={desc}，用例中止",
+                on_absent, f"require_tap_el({rid or text or desc!r}) 超时")
         return True
+
+    def block_unless(self, cond, reason, probe=None):
+        """前置条件不满足 → 记 BLOCKED 并抛 CaseBlocked（中止用例）。
+
+        cond   : 布尔，或返回布尔的 callable（惰性求值：只在需要时才 dump/查询）
+        reason : 给人看的前置条件说明（进报告，也进 §10.1 的 Ask 通道）
+        probe  : 可选现场信息（如关键 rid 是否存在），便于人判断该补什么
+
+        用法：
+            t.block_unless(lambda: t.el_bounds(rid=RID_LIST), "需先有一条课程表")
+        """
+        try:
+            ok = cond() if callable(cond) else bool(cond)
+        except Exception as e:
+            ok = False
+            reason = f"{reason}（判定本身抛异常: {e}）"
+        if ok:
+            return True
+        msg = f"前置条件不满足: {reason}"
+        if probe is not None:
+            msg += f"｜现场: {probe}"
+        self.record("BLOCKED", msg)
+        raise CaseBlocked(msg)
 
     def tap_xy(self, x, y, observe=True):
         """坐标点击（最后手段；优先用 tap_el/tap_text/tap_rid）。返回 True
@@ -1374,45 +1875,235 @@ class TestCase:
         每次轮询都会 dump UI 树并顺带驱动弹窗看门狗。"""
         deadline = time.time() + timeout
         t0 = time.time()
+        hit = False
         while True:
             if self.el_bounds(rid=rid):
-                self._event("wait", f"rid={rid}", result="hit", start=t0)
-                return True
+                hit = True
+                break
             if time.time() >= deadline:
-                self._event("wait", f"rid={rid}", result="timeout", start=t0)
-                return False
+                break
             time.sleep(interval)
+        self._note_wait(time.time() - t0)          # RunMetrics：等待次数/时长
+        self._event("wait", f"rid={rid}", result="hit" if hit else "timeout",
+                    start=t0)
+        return hit
 
     def wait_text(self, text, timeout=10.0, interval=0.5):
         """轮询等待指定文字出现。出现返回 True，超时 False。"""
         deadline = time.time() + timeout
         t0 = time.time()
+        hit = False
         while True:
             if self.el_bounds(text=text):
-                self._event("wait", f"text={text}", result="hit", start=t0)
-                return True
+                hit = True
+                break
             if time.time() >= deadline:
-                self._event("wait", f"text={text}", result="timeout", start=t0)
-                return False
+                break
             time.sleep(interval)
+        self._note_wait(time.time() - t0)          # RunMetrics：等待次数/时长
+        self._event("wait", f"text={text}", result="hit" if hit else "timeout",
+                    start=t0)
+        return hit
 
     def wait_activity(self, substr, timeout=10.0, interval=0.5):
         """轮询等待前台 Activity 包含 substr（大小写不敏感）。
         命中返回完整 Activity 名，超时返回 ""（falsy，可直接当 bool 用）。"""
         deadline = time.time() + timeout
         t0 = time.time()
+        act = ""
         while True:
             try:
                 act = self.current_activity()
             except Exception:
                 act = ""
             if substr.lower() in act.lower():
-                self._event("wait", f"activity={substr}", result="hit", start=t0)
-                return act
+                break
             if time.time() >= deadline:
-                self._event("wait", f"activity={substr}", result="timeout", start=t0)
-                return ""
+                act = ""                           # 超时统一返回 ""（falsy 契约）
+                break
             time.sleep(interval)
+        self._note_wait(time.time() - t0)          # RunMetrics：等待次数/时长
+        self._event("wait", f"activity={substr}",
+                    result="hit" if act else "timeout", start=t0)
+        return act
+
+    def wait_gone(self, rid=None, text=None, desc=None, timeout=10.0,
+                  interval=0.5):
+        """轮询等待元素**消失**（删除类断言的另一半）。消失 True，超时 False。
+
+        为什么需要它：现有 wait_* 全是"等出现"，于是"课程已消失"这类断言只能写成
+        `assert not t.el_bounds(...)`（删除动画还没播完就判 → **假 FAIL**）或
+        `time.sleep(2)` 再判（正是 M2 要消灭的裸 sleep）。
+
+        无判据时**抛错**而不是返回 True —— 后者会让"忘了传参数"变成一条静默的
+        假 PASS（§〇：断言类不许静默降级）。
+        """
+        if not (rid or text or desc):
+            raise ValueError("wait_gone 需要 rid / text / desc 至少一个判据")
+        deadline = time.time() + timeout
+        t0 = time.time()
+        gone = False
+        while True:
+            if not self.el_bounds(rid=rid, text=text, desc=desc):
+                gone = True
+                break
+            if time.time() >= deadline:
+                break
+            time.sleep(interval)
+        self._note_wait(time.time() - t0)          # RunMetrics：等待次数/时长
+        self._event("wait", f"gone rid={rid} text={text} desc={desc}",
+                    result="hit" if gone else "timeout", start=t0)
+        return gone
+
+    def wait_text_contains(self, sub, timeout=10.0, interval=0.5):
+        """轮询等待**子串**出现（`wait_text` 是精确匹配，这里是 contains）。
+
+        为什么需要它：`wait_text` 走 `el_bounds(text=...)` = **精确相等**，而现实里
+        要等的东西常是"某句话里含某个词" —— 典型是询问框文案
+        「是否根据课程时长和休息时长自动调整其他课程」，等它只能靠子串。
+        旧写法只能 `time.sleep(2.5)` + 一次性 `screen_text()` 判，那正是碰运气
+        （界面慢一点就假 FAIL，快一点就白等）。
+
+        ⚠️ 不要拿它等"弹框是否还开着"（子串无法表达"消失"）：那种场景用
+        `wait_gone(text=<按钮文案>)`。
+        """
+        deadline = time.time() + timeout
+        t0 = time.time()
+        hit = False
+        while True:
+            if any(sub in x for x in self.screen_text()):
+                hit = True
+                break
+            if time.time() >= deadline:
+                break
+            time.sleep(interval)
+        self._note_wait(time.time() - t0)
+        self._event("wait", f"text~={sub}", result="hit" if hit else "timeout",
+                    start=t0)
+        return hit
+
+    def wait_text_any_contains(self, subs, timeout=10.0, interval=0.5):
+        """等**任意一个**子串出现（共享一个时间预算）。返回命中的那个，超时返回 ""。
+
+        为什么单列一个 API：现实里"等结果"常常是**多候选**——权限被拒后的提示可能是
+        「相机权限」也可能是「前往设置」（同一语义两种文案，见
+        `knowledge/_system.md`）。用单个 `wait_text_contains` 会漏一种；**顺序等两次**
+        会把时间预算翻倍（3+3=6s）。这里共用一个 deadline，命中即返回命中的那个
+        （所以它同时承担"等到了"与"等到的是哪种"两个信息）。
+
+        返回空串是 falsy 契约，与 `wait_activity` 一致，可直接当 bool 用。
+        """
+        subs = [s for s in (subs or ()) if s]
+        if not subs:
+            raise ValueError("wait_text_any_contains 需要至少一个候选子串")
+        deadline = time.time() + timeout
+        t0 = time.time()
+        hit = ""
+        while True:
+            txt = " ".join(self.screen_text())
+            for s in subs:
+                if s in txt:
+                    hit = s
+                    break
+            if hit or time.time() >= deadline:
+                break
+            time.sleep(interval)
+        self._note_wait(time.time() - t0)
+        self._event("wait", f"text~any={subs}", result=hit or "timeout",
+                    start=t0)
+        return hit
+
+    # ── dump 快照复用（§7.2 M4）─────────────────────────────────────
+    # 目标：dump 次数 ≤2×步数（基线 116 ≈ 3.7×步数）。
+    # 两个消费方都要求"一次 dump 供多处使用"：
+    #   · 组合定位的优先级链（§4.2）——三级降级必须在同一份树上完成
+    #   · 失败工件包取样（§五）——FAIL 时抓"当时那份"XML
+    # ⚠️ TTL 必须**短**：缓存越久，"看到旧界面"的风险越大，而 UI 当前状态
+    # 正是断言的前提。轮询里一律 refresh=True（每次都要新鲜）。
+    SNAPSHOT_TTL = 1.5
+
+    def dump_snapshot(self, ttl=None, refresh=False):
+        """取一份 dump（短 TTL 内复用）。返回 XML 字符串。
+
+        用例里出现"同一时刻要查多个目标"时用它，避免 N 次 dump：
+            xml = t.dump_snapshot()
+            if t.el_bounds(rid=A, xml=xml) or t.el_bounds(text=B, xml=xml): ...
+        """
+        ttl = self.SNAPSHOT_TTL if ttl is None else ttl
+        now = time.time()
+        snap = getattr(self, "_snap", None)
+        if not refresh and snap and (now - snap[0]) <= ttl:
+            self._snap_hits = getattr(self, "_snap_hits", 0) + 1
+            return snap[1]
+        xml = self._dump()
+        self._snap = (now, xml)
+        self._snap_miss = getattr(self, "_snap_miss", 0) + 1
+        return xml
+
+    def region_of(self, rid=None, text=None, desc=None, pad=20):
+        """元素 bounds → OCR 区间 `(y_min, y_max, x_min, x_max)`；取不到 None。
+
+        §3.1「数值类缓存禁止进 case」的运行时替代：卡片/用例里不再写死
+        y_min/y_max，改为从 anchor 元素现场派生（换设备/换方向自动成立）。
+        """
+        b = self.el_bounds(rid=rid, text=text, desc=desc)
+        if not b:
+            return None
+        x1, y1, x2, y2 = b
+        return (max(0, y1 - pad), y2 + pad, max(0, x1 - pad), x2 + pad)
+
+    def swipe(self, x1, y1, x2, y2, duration=0.3):
+        """通用滑动（坐标由调用方按**当次屏幕尺寸**派生，禁止写死像素）。
+
+        各用例此前手写 `t.d.swipe` / `adb shell input swipe`（21 文件里散落多处），
+        统一入口后动作计数与失败语义一致（§2.2）。
+        """
+        t0 = time.time()
+        try:
+            self.d.swipe(x1, y1, x2, y2, duration)
+        except Exception as e:
+            try:
+                self.adb_shell("input", "swipe", str(int(x1)), str(int(y1)),
+                               str(int(x2)), str(int(y2)),
+                               str(int(duration * 1000)))
+            except Exception as e2:
+                print(f"[swipe] 失败 ({x1},{y1})→({x2},{y2}): {e} / {e2}")
+                return False
+        self._log_action("swipe", f"({x1},{y1})→({x2},{y2}) d={duration}", t0)
+        return True
+
+    def scroll_to_rid(self, rid, timeout=12.0, max_swipes=6, direction="up",
+                      ratio=0.5, x_ratio=0.5, settle=0.4):
+        """循环"滑动 → 查树"直到 rid 出现且有 bounds。返回 bounds 或 None。
+
+        解决 §2.4 归因②「没滚到」：小屏/换形态后控件进 overflow、长列表懒加载
+        （178 的"晚上课程"就是首屏不渲染）。此时 `wait_rid` **永远等不到** ——
+        rid 根本不在树上，不是渲染慢，等多久都没用。
+
+        direction="up"：内容向上滚（手指上滑 → 看到下面的内容）；"down" 反之。
+        位置全部按屏幕比例派生，不写死像素。
+        """
+        b = self.el_bounds(rid=rid)
+        if b:
+            return b
+        w, h = self._screen_size()
+        x = int(w * x_ratio)
+        step = int(h * ratio)
+        if direction == "up":
+            y_from, y_to = int(h * 0.75), int(h * 0.75) - step
+        else:
+            y_from, y_to = int(h * 0.25), int(h * 0.25) + step
+        deadline = time.time() + timeout
+        for _ in range(max_swipes):
+            if time.time() >= deadline:
+                break
+            if not self.swipe(x, y_from, x, y_to, 0.3):
+                break
+            time.sleep(settle)      # settle：等惯性滚动停下（无 UI 信号可等）
+            b = self.el_bounds(rid=rid)
+            if b:
+                return b
+        return None
 
     # ── 系统级操作（通用前置条件）────────────────────────────────
     def adb_shell(self, *args):
@@ -1905,17 +2596,84 @@ class TestCase:
                     pass
         return duration_ms
 
-    def _auto_screenshot(self, label=None, add_to_step=True):
+    # 截图降载（§7.2 M3：总量 16.3MB → ≤6MB）
+    # ⚠️ 2026-09-16 人确认：**每步仍要留图**，不许靠"少截图"换指标 —— 那会削弱
+    # 证据链（原则 2），而 M3 的目的是"同样的证据更小"，不是"更少的证据"。
+    # 因此：张数**不限**（SHOT_PER_STEP=0），体积只靠等比压缩达成。
+    # 若压缩后仍超标，正解是继续调 SHOT_MAX_SIDE/编码，而不是丢截图。
+    SHOT_MAX_SIDE = 1280    # 长边上限（0=不缩）；与 vision 侧 resize_for_vision 同口径
+    SHOT_PER_STEP = 0       # 0=不限（见上）；保留该开关仅为压测/排查时临时收窄
+    # 编码格式：**WebP 是 M3 达标的关键杠杆**。
+    # 真机实测（2026-09-16，178 的 115 张 1280×802 截图，同尺寸同内容对比）：
+    #     PNG     14.23MB  ← 只压分辨率（原方案）：离 ≤6MB 差 2.4×
+    #     JPEG80  11.60MB  ← 换 JPEG 也**不够**（UI 截图里文字边缘多，JPEG 优势小）
+    #     WebP75   3.69MB  ← ✅ 达标（且留 1.6× 余量）
+    # 故默认 WebP。`jpg` / `png` 保留为可切换值（png = 无损兜底，逐像素比对时用）。
+    # ⚠️ 换格式要同步认扩展名的两处 glob：`_count_screenshots`（本文件）与
+    # `check_facts._grep_storage`（只认 .png 会让"M3 统计归零"+"事实核查误报"）。
+    SHOT_FORMAT = "webp"
+    SHOT_QUALITY = 75
+
+    def _encode_shot(self, raw):
+        """截图编码：长边压缩 + 格式转换。返回 `(bytes, 扩展名)`。
+
+        两级降载（M3）：① 长边压到 `SHOT_MAX_SIDE`；② 编 JPEG（见类属性处的实测
+        数据：只做 ① 时 178 是 14.2MB，离 ≤6MB 差 2.4×）。
+
+        **编码失败一律回退原图 PNG** —— 优化不许让证据丢失（宁可大，不可没有）。
+        """
+        max_side = getattr(self, "SHOT_MAX_SIDE", 1280)
+        fmt = str(getattr(self, "SHOT_FORMAT", "jpg") or "png").lower()
+        try:
+            from screenshot import ScreenImage, resize_for_vision
+            # max_side=0 表示"不缩"：resize_for_vision 的判据是 `m <= max_side`，
+            # 传 0 会被判成"要缩到 0"——所以这里换成一个极大的值表达"不缩"。
+            si = resize_for_vision(ScreenImage.from_bytes(raw),
+                                   max_side or 100000)
+            if fmt in ("jpg", "jpeg", "webp"):
+                buf = io.BytesIO()
+                img = si.image.convert("RGB")
+                if fmt == "webp":
+                    img.save(buf, format="WEBP",
+                             quality=int(getattr(self, "SHOT_QUALITY", 75)),
+                             method=4)
+                    return buf.getvalue(), "webp"
+                img.save(buf, format="JPEG",
+                         quality=int(getattr(self, "SHOT_QUALITY", 75)),
+                         optimize=True)
+                return buf.getvalue(), "jpg"
+            return (si.png_bytes or raw), "png"
+        except Exception as e:
+            # 回退原图 PNG：优化失败只许"变大"，不许"丢证据"
+            print(f"[截图降载] 编码失败，落原图 PNG: {e}")
+            return raw, "png"
+
+    def _auto_screenshot(self, label=None, add_to_step=True, force=False):
         """自动截图：操作/验证点统一入口。label 为 None 时用 'auto'。
         add_to_step=False 用于验证点截图（record 会单独在 result 中展示，
-        不混入步骤级证据列表，避免报告重复）。"""
+        不混入步骤级证据列表，避免报告重复）。
+
+        M3 降载（§7.2）：**每步都留图**（人确认 2026-09-16），体积只靠压缩。
+        · 张数默认**不限**（`SHOT_PER_STEP=0`）：证据链优先于指标。
+          `step()` 仍重置 `_shot_in_step` 计数，供报告显示"每步几张"。
+        · **长边 ≤SHOT_MAX_SIDE** 等比压缩 —— 16.3MB 的量级来自全分辨率 PNG，
+          压缩后报告与人工排查仍够看。
+        · `force=True`（FAIL 证据 / §5 工件包）永远截图，且不受任何配额影响。
+        """
+        step_cap = 0 if force else getattr(self, "SHOT_PER_STEP", 0)
+        if add_to_step and self._cur_step is not None and step_cap:
+            if getattr(self, "_shot_in_step", 0) >= step_cap:
+                self._shot_skipped = getattr(self, "_shot_skipped", 0) + 1
+                return None
         self._shot_idx += 1
         safe = re.sub(r'[\\/:*?"<>|]', "_", label or "auto")
-        path = os.path.join(self.case_dir, f"{self._shot_idx:02d}_{safe}.png")
-        raw = self._screencap_bytes()
+        # 先编码再定文件名：扩展名由编码器决定（JPEG 是 M3 达标的关键杠杆）
+        raw, ext = self._encode_shot(self._screencap_bytes())
+        path = os.path.join(self.case_dir, f"{self._shot_idx:02d}_{safe}.{ext}")
         with open(path, "wb") as f:            # 显式关闭：不依赖 CPython 引用计数实现差异
             f.write(raw)
         if add_to_step and self._cur_step is not None:
+            self._shot_in_step = getattr(self, "_shot_in_step", 0) + 1
             self._cur_step["evidences"].append(path)
             # 步骤级操作截图也入库，供 Web UI 展示
             if self._db is not None and self._db_step_id is not None:
@@ -1962,17 +2720,37 @@ class TestCase:
     def screen_text(self):
         xml = self._dump()
         self._run_dialog_watchers(xml)
-        return [n["text"] for n in _parse_nodes(xml) if n["text"]]
+        nodes = _parse_nodes(xml)
+        self._note_rids(nodes)
+        return [n["text"] for n in nodes if n["text"]]
 
     # ── OCR（Canvas 内容读取）────────────────────────────────────────
-    def ocr(self, y_min=0, y_max=99999, x_min=0, x_max=99999, image_bytes=None):
+    def ocr(self, y_min=0, y_max=99999, x_min=0, x_max=99999, image_bytes=None,
+            below=None, above=None, region=None):
         """截屏 + rapidocr，返回 [(x, y, conf, text)]（原图像素坐标）。
         image_bytes：传入已定格的 PNG 字节时直接 OCR 它（capture_toast 用），
         不传则现场截屏。
 
         ⚠️ 调用方**不要写死像素范围**（换设备 / 换方向即失效）：范围应从元素 bounds
-        或当次窗口尺寸派生。传了非默认范围却一条都没读到时会记 WARN ——
-        「指定区域读空」是设备相关硬编码最典型的静默降级，必须可见。"""
+        或当次窗口尺寸派生。**三个派生入口**（§2.2 / §3.1，替代手写像素值）：
+
+            t.ocr(region=t.region_of(RID_LIST))     # 由元素 bounds 直接派生
+            t.ocr(below=RID_HEADER, above=RID_NAV)  # 两个 anchor 之间的区域
+
+        anchor 取不到时**不缩范围**（退化为全屏）：提示错了最多慢一点，不会挂
+        （与 §3.2「缓存命中前验证 + 降级」同一原则）。
+
+        传了非默认范围却一条都没读到时会记 WARN ——「指定区域读空」是设备相关
+        硬编码最典型的静默降级，必须可见。"""
+        if region is not None:
+            y_min, y_max, x_min, x_max = region
+        if below is not None or above is not None:
+            b = self.el_bounds(rid=below) if isinstance(below, str) else below
+            if b:
+                y_min = max(y_min, b[3])    # anchor 底边 → 区域起点在其下方
+            b = self.el_bounds(rid=above) if isinstance(above, str) else above
+            if b:
+                y_max = min(y_max, b[1])    # anchor 顶边 → 区域终点在其上方
         if self._ocr is None:
             from rapidocr_onnxruntime import RapidOCR
             self._ocr = RapidOCR()
@@ -2173,7 +2951,7 @@ class TestCase:
         return info
 
     @staticmethod
-    def cleanup_probes(max_idle_min=30, verbose=True):
+    def cleanup_probes(max_idle_min=None, verbose=True):
         """清理**超时未访问**的探查缓存（storage/probes/<包名>/<label>/）。
 
         规则（2026-09-10 讨论定稿）：读 meta.json 的 `accessed`（最后访问时间），
@@ -2186,9 +2964,26 @@ class TestCase:
         **为什么是"最后访问"而非"创建"**：写用例可能跨数小时（183 探查→验证
         跨 2 小时），按创建时间会在使用中删掉正在查的缓存，反而逼着重跑真机。
 
+        **max_idle_min 缺省跟随环境变量 `DSH_PROBES_MAXIDLE_MIN`**（未设置 = 30，
+        与历史行为逐字节一致）；显式传数字则优先于环境变量。与 traces 侧
+        `DSH_TRACE_MAXIDLE_MIN` 同一模式（trace_recorder.py:57-59）。
+        **设 0（或负数）= 关闭清理**：调试期需长期保留同一批 probes 供离线预检
+        （inventory.py verify）时用 —— 30 分钟会在写用例途中把缓存清掉，逼着
+        回真机重探，是"改一点要整跑"的直接成因之一。
+        ⚠️ 旧实现把 0 直接当阈值（cutoff = now → **删光所有缓存**），与 traces 侧
+        "设 0 可关闭"语义相反，本次一并修正（回归保护见 tests 的
+        TestCleanupProbesTtl）。
+
         返回 (删除数, 保留数)。由 run_case.py 启动时调用。
         """
         import json
+        if max_idle_min is None:
+            try:
+                max_idle_min = int(os.environ.get("DSH_PROBES_MAXIDLE_MIN", "30") or 0)
+            except ValueError:      # 非法值 → 回落 30（既不静默跳过清理，也不阻断执行）
+                max_idle_min = 30
+        if max_idle_min <= 0:
+            return (0, 0)           # 0/负数 = 关闭清理（与 traces 侧同语义）
         if not os.path.isdir(PROBE_DIR):
             return (0, 0)
         cutoff = time.time() - max_idle_min * 60
@@ -2306,6 +3101,51 @@ class TestCase:
                 counts[r["result"]] = counts.get(r["result"], 0) + 1
         return counts
 
+    def _emit_change_attribution(self):
+        """版本门禁 + 双信号源归因（§4.1 / §10.2）。
+
+        信号 1 = 版本（APK 替换）：run_case 启动时采集，经环境变量传来；
+        信号 2 = 元素集合指纹（本轮 rid 集合 hash，服务端 / A-B 变更）。
+
+        命中 `apk` / `config` 时记一条 WARN —— 这样报告里就能回答"用例行为变了，
+        是因为版本变化还是其他"（§10.2 的「本次与历史的差异」节）。`script` /
+        `layout` / `unchanged` 只打控制台，不记 WARN（见 version_gate 的取舍说明）。
+        """
+        sp = getattr(self, "script_path", None)
+        db = getattr(self, "_db", None)
+        if not sp or db is None:
+            return
+        import run_metrics as _rm
+        import version_gate as _vg
+        prev = db.latest_metrics(sp, exclude_id=getattr(self, "_db_case_id", None))
+        static = _rm.load_static() or {}
+        rids = sorted(getattr(self, "_rid_seen", None) or ())
+        cur = {
+            "script_hash": static.get("script_hash"),
+            "app_version_name": static.get("app_version_name"),
+            "app_version_code": static.get("app_version_code"),
+            "rid_set_hash": _rm.rid_set_hash(rids),
+            "device": getattr(self, "device_info", None),
+        }
+        lines, code = _vg.gate_warn_lines(prev, cur, static.get("card_version"))
+        # 存下来给 _write_healing_log 用：APK 真的变了就要清掉该 App 的降级记录
+        self._attribution_code = code
+        # 完整明细（哪些 rid 新增/消失）——§10.2 要求报告给明细而不是只给 hash
+        if code == "config" and prev.get("rid_set"):
+            try:
+                import json
+                gone, new = _rm.rid_diff(json.loads(prev["rid_set"]), rids)
+                print(f"[变更归因] 消失的 rid {len(gone or [])} 个、新增 "
+                      f"{len(new or [])} 个（明细见 RunMetrics 的 rid_set 列）")
+            except Exception:
+                pass
+        if lines:
+            self.record("WARN", "版本/界面漂移（" + code + "）：" + "；".join(lines))
+        elif code == "no_baseline":
+            print("[变更归因] 首次运行，无可比基线 → 跳过对比（不标未归因）")
+        else:
+            print(f"[变更归因] {code}：与上次一致或无产品侧变更")
+
     def _case_package_from_script(self):
         """从用例脚本路径推断被测包名（cases/<包名>/<脚本>.py，目录名像包名才认）。
 
@@ -2344,6 +3184,18 @@ class TestCase:
                 print(f"[提示] 旧报告已备份为 {os.path.basename(bak)}", flush=True)
             except Exception as e:
                 print(f"⚠️ 旧报告备份失败: {e}")
+        # ── 版本门禁 + 变更归因（§4.1 双信号源 / §10.2 决策表）──────────
+        # 位置刻意在 _compute_final_status **之前**：门禁命中要以 WARN 进入
+        # 结论，否则报告与退出码上完全看不见（只剩一行控制台输出）。
+        try:
+            self._emit_change_attribution()
+        except Exception as e:
+            print(f"⚠️ [版本门禁] 检测失败（不阻断收尾）: {e}")
+        # P5：降级留痕落盘（healing_log.json + count 达阈值的知识卡更新提案）
+        try:
+            self._write_healing_log()
+        except Exception as e:
+            print(f"⚠️ [healing] 落盘失败（不阻断收尾）: {e}")
         counts = self._result_counts()
         pass_n, fail_n = counts["PASS"], counts["FAIL"]
         warn_n, blocked_n, info_n = counts["WARN"], counts["BLOCKED"], counts["INFO"]
@@ -2444,12 +3296,22 @@ class TestCase:
         summary = (f"✅ {pass_n} 通过 / ❌ {fail_n} 失败 / ⚠️ {warn_n} 警告 / "
                    f"⛔ {blocked_n} 阻塞 / ℹ️ {info_n} 记录 / 共 {total} 条断言")
         lines.append(f"\n---\n**汇总**: {summary} / 耗时 {duration_sec}s")
+        # ── M4 口径：dump 次数 ÷ **断言/定位点数**（2026-09-16 人确认）──────
+        # 分母**不是** `t.step()` 数：dump 的目的是"定位/断言前读一次屏"，而 step
+        # 是**组织单位**、不是工作量单位。178 实测：8 个 step、45 条 record、
+        # 120 次 dump → 按 step 是 15.0×（看起来严重超标）、按 record 是 2.7×
+        # （真实水平）。口径混用会让指标完全失真，所以这里把分母写死在产出物里。
+        n_points = total + warn_n + blocked_n + info_n
+        dump_ratio = (self._dump_count / n_points) if n_points else 0.0
+        lines.append(f"**UI 采集**: {self._dump_count} 次 dump"
+                     f"（{dump_ratio:.1f}× 断言/定位点 {n_points}；M4 目标 ≤2×）")
         lines.append(f"**最终结论**: {self.final_status}")
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
         print(f"\n📄 报告已生成: {path}")
         print(f"🏁 最终结论: {self.final_status}（{summary}）")
-        print(f"📊 UI dump 次数: {self._dump_count}")
+        print(f"📊 UI dump 次数: {self._dump_count}"
+              f"（{dump_ratio:.1f}× 断言/定位点 {n_points}；M4 目标 ≤2×）")
         # 完成用例记录入库
         if self._db is not None and self._db_case_id is not None:
             finished_ok = False
@@ -2471,7 +3333,8 @@ class TestCase:
                     derived=getattr(self, "_derived_clicks", 0),
                     dump=getattr(self, "_dump_count", 0),
                     rot_start=getattr(self, "_rotation_start", None),
-                    rot_end=getattr(self, "_rotation_end", None))
+                    rot_end=getattr(self, "_rotation_end", None),
+                    **self._run_metrics_extra())
             except Exception as e:
                 print(f"⚠️ [db] 度量入库失败: {e}")
             # ── 记录清理放在**结尾**，不在 start_case / __init__（2026-09-15 改）──

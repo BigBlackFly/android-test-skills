@@ -2,6 +2,13 @@
 
 > **何时读本文件**：按 SKILL.md 工作流第 3 步「写用例脚本」时打开。
 > 返回 → [SKILL.md](../SKILL.md) 核心原则 / [explore-guide.md](explore-guide.md) 探索 SOP
+>
+> **节级路由（只读你要的那节，本文件 238 行别整读）**：
+> 要用某个 API → 「框架 API 速查」｜定位/旋屏怎么写 → 「定位规范与旋屏约定」
+> 弹窗/权限/Toast → 「关键技术 → 弹窗看门狗 / 系统弹窗与 Toast」
+> 图上找东西、选素材 → 「关键技术 → 视觉定位 / 图库列表选资产」
+> 坐标从哪来 → 「关键技术 → 坐标/方向类事实一律运行时标定」
+> 判 PASS 还是 FAIL → 「结果分类」｜提交前自检 → 「注意事项」
 
 ## 框架 API 速查
 
@@ -66,6 +73,66 @@ t.adb_shell("cmd", "args")        # adb shell 直通（绑定本用例 serial；
 t.current_package() / t.current_activity()  # 前台包名/完整 Activity
 t.finish() -> 报告路径
 ```
+
+### 条件等待（P1b 新增；全部"命中即停、超时有界"）
+
+```python
+t.wait_rid(rid, timeout=10)              # 等出现
+t.wait_text(text, timeout=10)            # 等出现（**精确匹配**：n.text == text）
+t.wait_activity(substr, timeout=10)      # 等 Activity；命中返回完整名，超时返回 ""
+t.wait_gone(rid=..., timeout=10)         # 等**消失**（P1b；删除类断言的另一半）
+t.scroll_to_rid(rid, timeout=12, max_swipes=6, direction="up")   # 循环 swipe+查树（P1b）
+```
+
+- `wait_gone` 无判据时**抛错** —— 不许静默返回 True（那会变成假 PASS）。
+- `wait_text` 是**精确匹配**；要子串/正则自己用 `screen_text()` 判，或用 `tap_text_re`。
+- `scroll_to_rid` 解决"rid 根本不在树上"（小屏折叠 / 长列表懒加载）：这时 `wait_rid`
+  **等多久都没用**，必须滚（定位失效四归因见 SKILL.md §2.4）。
+  `swipe(x1,y1,x2,y2,dur)` 也已上提到框架（别再手写 `t.d.swipe` / `input swipe`）。
+
+### 区域派生（禁止写死像素，§3.1）
+
+```python
+t.ocr(region=t.region_of(RID_LIST))      # 元素 bounds → OCR 区间
+t.ocr(below=RID_HEADER, above=RID_NAV)   # 两个 anchor 之间的区域
+t.region_of(rid)                         # → (y_min, y_max, x_min, x_max) 或 None
+```
+
+anchor 取不到时**不缩范围**（退化全屏）：提示错了最多慢一点，不会挂。
+
+### 一份 dump 查多个目标（M4）
+
+```python
+xml = t.dump_snapshot()                  # 短 TTL（1.5s）内复用，避免 N 次 dump
+t.el_bounds(rid=A, xml=xml) or t.el_bounds(text=B, xml=xml)
+```
+
+`el_bounds` 的优先级是 **rid > desc > text**，且三级在**同一份 dump** 内完成
+（§4.2 硬约束：跨 dump 重找会让"相似元素"的身份保证断裂 → 报告写"自愈成功"却点了
+别的元素）。给了 rid 却靠 desc/text 命中时会留**降级留痕**，进报告与 `healing_log.json`。
+
+**定位正确性的四条保证**（2026-09-16 补；rid 优先不变，补的是"取到的到底对不对"）：
+
+| 情形 | 行为 | 为什么 |
+|---|---|---|
+| 同一 rid 命中多个（容器 + 子控件） | 优先 `clickable=true`；无则可点击则取**面积最小**；仍并列标 `ambiguous` 并留痕 | "取树序第一个"常点到容器（可能被拦截，或点到错误位置） |
+| rid 命中但 **bounds 为空**（出屏/折叠/未布局） | **返回 None 且绝不降级** → 用 `scroll_to_rid` 滚，或报"找不到" | 退到 text 会命中一个同名乱入的无关节点并"成功"点到错的东西 —— **比找不到更危险**（报告还是绿的） |
+| rid 只回本地名（无包名前缀） | 精确匹配优先，本地名兼容作第二级 | 跨包同名节点不许抢先命中 |
+| 断言 | **永不降级** | 降级链只用于"找要点哪个"，不参与"判断结果对不对" |
+
+`present_no_bounds` 会打印 `↕️ <rid>: 在 UI 树上但无可交互 bounds（出屏/折叠）→ 需要滚动`。
+看到它就说明**该用 `scroll_to_rid`**，而不是去改定位属性（改成 text 只会点到别的元素）。
+
+### 前置条件不满足 → BLOCKED（不是 FAIL）
+
+```python
+t.block_unless(lambda: t.el_bounds(rid=RID_LIST), "需先有一条课程表")
+t.require_tap_rid(RID_SAVE, on_absent="BLOCKED")     # 默认仍是 FAIL
+```
+
+为什么要分：`require_*` 找不到元素有两种成因 —— App 真坏了（FAIL）vs 前置条件缺失
+（BLOCKED）。混成同一个会让缺陷库被环境噪音污染，且"配置差异除外"永远无法机械判定。
+退出码：FAIL=1、BLOCKED=2。
 
 ## 定位规范与旋屏约定（硬约定）
 

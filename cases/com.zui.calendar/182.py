@@ -35,13 +35,14 @@ USER_INPUT = """测试用例 联想日历_182
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_framework import TestCase
-from _flow import goto_手动创建课程表, PKG
+from _flow import goto_手动创建课程表, open_新建课程, PKG
 
 WEEKEND_SW = "com.zui.calendar:id/switch_weekend_classes"
 NAME_RID = "com.zui.calendar:id/et_schedule_name"
 SAVE_RID = "com.zui.calendar:id/action_save"
 EMPTY_RID = "com.zui.calendar:id/cv_empty_content"
-ADD_HINT_RID = "com.zui.calendar:id/iv_add_hint"
+# 注：`iv_add_hint`（旧的"点空格后出现的加号浮标"）**已从 App 移除**（2026-09-17
+# 探针实测），链路直接走 _flow.open_新建课程()，不再需要该定位目标。
 
 ET_COURSE_NAME = "com.zui.calendar:id/etCourseName"
 LL_TIME = "com.zui.calendar:id/llCourseTime"
@@ -98,24 +99,14 @@ def _set_weeks(t, want, total=20):
 
 
 def _enter_add_course(t):
-    """从空课表点空格→+→进新建课程页。返回是否成功。"""
-    empt = t.el_bounds(rid=EMPTY_RID)
-    if not empt:
-        t.record("FAIL", "空课表无 cv_empty_content 可点")
-        return False
-    cx, cy = (empt[0] + empt[2]) // 2, (empt[1] + empt[3]) // 2
-    t.tap_xy(cx, cy)
-    time.sleep(1.2)
-    hint = t.el_bounds(rid=ADD_HINT_RID)
-    if not hint:
-        t.record("FAIL", "点空格后未出现加号浮标 iv_add_hint")
-        return False
-    t.tap_xy((hint[0] + hint[2]) // 2, (hint[1] + hint[3]) // 2)
-    time.sleep(1.5)
-    if not t.wait_rid(ET_COURSE_NAME, timeout=8):
-        t.record("FAIL", "再次点击加号后未进入新建课程页（无 etCourseName）")
-        return False
-    return True
+    """从空课表点空格 → 进新建课程页。返回是否成功。
+
+    ⚠️ App 已改版（2026-09-17 探针实测，见 evals/probe_addhint.py）：中间的加号
+    浮标 `iv_add_hint` **已被移除**，且**第一次点空格会被"吸收"**、第二次才进编辑页
+    —— 本函数原先卡在"等加号"，所以 2026-09-16 全量套件在这里 FAIL。
+    现统一走 `_flow.open_新建课程()`（点一次不成再点一次、命中即停）。
+    """
+    return open_新建课程(t)
 
 
 def run():
@@ -138,7 +129,8 @@ def run():
     else:
         t.record("PASS", "周末开关已为关（或初始即关），保持关闭")
     t.tap_rid(SAVE_RID, silent=True)
-    time.sleep(3)
+    # 原有的 `sleep(3)` 已删：后面的 wait_rid(EMPTY_RID, 10) 覆盖这段等待
+    # （原来最坏 sleep3 + wait10 = 13s，现在最坏 10s 且命中即停）。
     if not t.wait_rid(EMPTY_RID, timeout=10):
         t.record("FAIL", "保存后未到达空课表（无 cv_empty_content）")
         t.blocked("前置未达成")
@@ -200,7 +192,8 @@ def run():
     # ── Step4：点击上课周数 ──────────────────────────────────
     t.step("Step4 上课周数（多选弹框）")
     t.tap_rid(LL_WEEKS, silent=True)
-    time.sleep(1.2)
+    # 等弹框标题出现（原来是 sleep(1.2) + 单次读屏：弹框慢一点即假 FAIL）
+    t.wait_text_contains("上课周数", timeout=1.2)
     texts = t.screen_text()
     title_ok = "上课周数" in texts
     quick = [k for k in ("全选", "单周", "双周") if k in texts]
@@ -279,7 +272,8 @@ def run():
     # ── Step5：点击课程背景色 ────────────────────────────────
     t.step("Step5 课程背景色（10 色块）")
     t.tap_rid(LL_COLOR, silent=True)
-    time.sleep(1.2)
+    # 同上：等弹框标题出现再判（原来是 sleep(1.2) + 单次读屏）
+    t.wait_text_contains("课程背景色", timeout=1.2)
     color_title = "课程背景色" in " ".join(t.screen_text())
     panel = t.el_bounds(rid="com.zui.calendar:id/customPanel")
     n_colors = None
@@ -306,9 +300,10 @@ def run():
     t.step("Step6 建第一节(1/3/5周)课程 + 占用校验")
     # 填课程名（必填），默认第1节；周数已设为 1/3/5
     t.input_text(ET_COURSE_NAME, "测试课程A")
+    # settle：等输入内容提交（变的是输入框的**值**，`wait_*` 表达不了 → 审计归"合理"）
     time.sleep(0.5)
     t.tap_text("完成", silent=True)  # 保存课程，回空课表
-    time.sleep(2.5)
+    # 原有的 `sleep(2.5)` 已删：下一行 wait_rid(EMPTY_RID, 10) 覆盖这段等待
     back_ok = t.wait_rid(EMPTY_RID, timeout=10) or ("测试课程A" in " ".join(t.screen_text()))
     t.record("PASS" if back_ok else "WARN",
              f"课程A(第1节,1/3/5周)已保存并回到课表(看到课程A={back_ok})")
@@ -318,6 +313,7 @@ def run():
     if not _enter_add_course(t):
         return t.finish()
     t.input_text(ET_COURSE_NAME, "测试课程B")
+    # settle：同上，等输入提交（值变化类，不可条件化）
     time.sleep(0.5)
     # 打开周数弹框，验证 1/3/5 被占用（未默认选中 + 点不动）
     t.tap_rid(LL_WEEKS, silent=True)
