@@ -499,6 +499,11 @@ class TestCasePackageInference(unittest.TestCase):
         t.script_path = script_path
         return t
 
+    def test_prepared_target_precedes_script_path(self):
+        t = self._mk("/repo/cases/com.zui.calendar/1.py")
+        t.target_package = "com.zui.gallery"
+        self.assertEqual(t._case_package_from_script(), "com.zui.gallery")
+
     def test_infers_from_windows_script_path(self):
         t = self._mk("C:\\Users\\u\\.agents\\skills\\android-test-skills"
                      "\\cases\\com.zui.calendar\\168.py")

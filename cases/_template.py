@@ -12,7 +12,7 @@ sys.path.insert(0, _HERE)  # 同目录 _flow.py：本 App 的可复用流程（�
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(_HERE)), "framework"))
 from test_framework import TestCase
 
-PKG = os.path.basename(_HERE)  # 目录名即包名
+PKG = None  # Agent 根据用例查阅 app_packages.py 后填写包名；无法确定时保留 None
 
 # 用户原始输入（口述用例全文）。run_case.py 启动时提取入库，
 # 没有 USER_INPUT 时追溯链断一环（只知道跑了什么脚本，不知道用户要什么）。
@@ -20,16 +20,15 @@ USER_INPUT = """（把用户口述的用例原文完整粘在这里：前提 / �
 
 
 def run():
-    t = TestCase("用例名称")  # ← 改成用例编号/名称
+    t = TestCase("用例名称", target_package=PKG)  # 初始化依次重置文件、接收包名、清数据、授权
+    # t.clear_sdcard_files()  # 仅在用例明确要求测试开始前设备中不能有任何图片或视频文件时调用。
 
     # ── 前置条件（可选）────────────────────────────────────────────
-    # 例1: 重置 App 到首次使用状态
-    # t.pm_clear("com.example.app")
-    # 例2: 环境判断，不满足直接 BLOCKED
+    # 环境判断，不满足直接 BLOCKED
     # if not t.has_network():
     #     t.blocked("环境原因：设备无网络")
     #     return t.finish()
-    # 例3: 冷启动 App（禁止裸拼 adb monkey —— 多设备会串台，一律用 t.launch_app）
+    # 冷启动 App（禁止裸拼 adb monkey —— 多设备会串台，一律用 t.launch_app）
     # t.launch_app(PKG)
 
     # ── 步骤 1 ─────────────────────────────────────────────────────

@@ -489,8 +489,10 @@ def _rot_name(rot):
 
 class TestCase:
     def __init__(self, name, device_id=None, case_dir=None, user_input=None, script_path=None,
-                 vision=None, env_ignore=()):
+                 vision=None, env_ignore=(), target_package=None):
         self.name = name
+        self.target_package = None
+        self.permissions_granted = None
         # 未显式传入时，从环境变量取（run_case.py 注入：用户原始输入 + 脚本路径）
         self.user_input = user_input if user_input is not None \
             else os.environ.get("DSH_CASE_USER_INPUT")
@@ -505,7 +507,7 @@ class TestCase:
         self._adb_run("shell", "input", "keyevent", "KEYCODE_WAKEUP", timeout=10)
         self._adb_run("shell", "wm", "dismiss-keyguard", timeout=10)
         # 防锁屏保活（根因防护）：USB 供电期间保持屏幕常亮，
-        # 避免长用例执行中设备因休眠超时被锁屏，导致后续 adb/u2 交互打到
+        # 避免长用例执行中设备因休眠超时被锁屏，导致后续 adb/u2 交互被打断
         # keyguard、dump 读不到 App 节点、元素定位失败 → 用例莫名 FAIL/BLOCKED。
         try:
             subprocess.run(self._adb("shell", "svc", "power", "stayon", "true"),
@@ -651,6 +653,34 @@ class TestCase:
         if _is_probe_case(self.name):
             import atexit
             atexit.register(self._cleanup_probe_artifacts)
+        # 所有用例及辅助脚本均在业务步骤前按固定顺序完成准备。
+        self._prepare_test_environment(target_package)
+
+    def _prepare_test_environment(self, target_package):
+        self._preparing_case = True
+        try:
+            self.step("初始化设备 sdcard")
+            self.reset_sdcard_files()
+
+            self.step("接收待测 App 包名")
+            start = time.time()
+            package = target_package.strip() if isinstance(target_package, str) else None
+            if not package or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+", package):
+                detail = "未提供有效的目标包名，跳过 App 数据清理和权限授予；待测 App 及包名由 Agent 确定"
+                self._log_action("set_target_package", detail, start)
+                self.record("INFO", detail, evidence=False)
+                return
+            self.target_package = package
+            self._log_action("set_target_package", package, start)
+
+            self.step("清空目标 App 数据")
+            if not self.pm_clear(package):
+                raise CaseAbort(f"清空 {package} 数据失败，未执行测试步骤")
+
+            self.step("授予目标 App 权限")
+            self.permissions_granted = self.grant_permissions(package)
+        finally:
+            self._preparing_case = False
 
     # ── 设备命令（统一带 serial，多设备时不会操作错机器）─────────────
     def _adb(self, *args):
@@ -1056,13 +1086,17 @@ class TestCase:
     def step(self, name):
         """开启一个步骤，返回 self（支持 with 或直接调用）"""
         stop_after = getattr(self, "_stop_after", None)
-        if stop_after is not None and len(self.steps) >= stop_after:
+        preparing = getattr(self, "_preparing_case", False)
+        case_steps = sum(not step.get("preparation", False) for step in self.steps)
+        if not preparing and stop_after is not None and case_steps >= stop_after:
             # 已跑满 N 步 → 不开新步骤，主动收尾（语义见 PartialRun）。
             # record 落在第 N 步里：报告里能看见"为什么提前结束"。
             self.record("INFO", f"--stop-after {stop_after}：已执行前 {stop_after} 步"
                                 "，提前收尾（局部执行，退出码 0、不入库）")
             raise PartialRun(f"--stop-after {stop_after}：只执行前 {stop_after} 步")
         self._cur_step = {"name": name, "results": [], "evidences": []}
+        if preparing:
+            self._cur_step["preparation"] = True
         self._shot_in_step = 0     # M3：每步截图配额从这里重新计
         self.steps.append(self._cur_step)
         if self._db is not None and self._db_case_id is not None:
@@ -2106,6 +2140,44 @@ class TestCase:
         return None
 
     # ── 系统级操作（通用前置条件）────────────────────────────────
+    def reset_sdcard_files(self):
+        """清理用户使用设备过程中产生的文件，并预置测试图片和视频。
+
+        清理对象包括图片、视频、下载文件及测试残留。
+        初始化时自动执行；测试资源预置到 /sdcard/media-resources。
+        """
+        return self._prepare_sdcard_files(preset=True)
+
+    def clear_sdcard_files(self):
+        """清理用户使用设备过程中产生的文件，不预置测试资源。
+
+        仅用于明确要求测试开始前设备中没有图片或视频文件的用例。
+        """
+        return self._prepare_sdcard_files(preset=False)
+
+    def _prepare_sdcard_files(self, preset):
+        """文件准备统一记录动作；失败记 BLOCKED 并中止。"""
+        from preparation.reset_sdcard_files import ResetSDCardFiles, ResetSDCardFilesError
+
+        action = "reset_sdcard_files" if preset else "clear_sdcard_files"
+        if self._cur_step is None:
+            self.step("文件准备")
+        start = time.time()
+        worker = ResetSDCardFiles(self._adb_run)
+        try:
+            result = worker.reset() if preset else worker.clear()
+        except ResetSDCardFilesError as exc:
+            detail = f"{action} 文件准备失败: {exc}"
+            self._log_action(action, detail, start)
+            self.record("BLOCKED", detail, evidence=False)
+            raise CaseBlocked(detail) from exc
+        detail = f"{action}: 设备使用过程中产生的用户文件已清理，保留 /sdcard/Android"
+        if preset:
+            detail += f"；预置 {result['files']} 个文件，{result['bytes']} 字节"
+        self._log_action(action, detail, start)
+        print(f"   {detail}")
+        return True
+
     def adb_shell(self, *args):
         """执行 adb shell 命令（已绑定本用例 serial），返回 stdout"""
         r = self._adb_run("shell", *args, timeout=30)
@@ -2118,15 +2190,24 @@ class TestCase:
         - 成功：仅记录操作到时间轴，不计为断言
         - 失败：环境准备未完成，必须暴露为 FAIL（否则测试结果不可信）
         - confirm=True：恢复旧行为，成功也记一条 PASS 断言
+        - 初始化之外调用时，清理成功后重新批量授权；授权失败仅记 WARN。
         """
         t0 = time.time()
-        out = self.adb_shell("pm", "clear", package)
+        user = self.adb_shell("am", "get-current-user")
+        if not user.isascii() or not user.isdigit():
+            self.record("FAIL", f"无法确定当前 Android 用户: {user!r}")
+            return False
+        out = self.adb_shell("pm", "clear", "--user", user, package)
         ok = "Success" in out
         self._log_action("pm_clear", f"package={package}, ok={ok}", t0)
         if not ok:
             self.record("FAIL", f"pm clear {package} 失败（环境准备未完成）: {out}")
         elif confirm:
             self.record("PASS", f"pm clear {package}: 成功")
+        if ok and not getattr(self, "_preparing_case", False):
+            granted = self.grant_permissions(package)
+            if package == getattr(self, "target_package", None):
+                self.permissions_granted = granted
         return ok
 
     def force_stop(self, package):
@@ -2292,6 +2373,30 @@ class TestCase:
         """设备是否有活动网络（dumpsys connectivity）"""
         out = self.adb_shell("dumpsys", "connectivity")
         return "Active default network: none" not in out
+
+    def grant_permissions(self, package):
+        """批量授权；成功返回 True，失败记录 WARN 并返回 False，不中止用例。"""
+        from preparation.grant_app_permissions import AppPermissionGranter, AppPermissionError
+
+        if self._cur_step is None:
+            self.step("权限准备")
+        start = time.time()
+        try:
+            result = AppPermissionGranter(self._adb_run).grant(package)
+        except AppPermissionError as exc:
+            detail = f"{package} 权限准备失败: {exc}"
+            self._log_action("grant_permissions", detail, start)
+            self.record("WARN", detail, evidence=False)
+            return False
+        detail = (f"{package}: 权限准备完成，已授予运行时权限 "
+                  f"{len(result['runtime_permissions'])} 项，补全 AppOps {len(result['appops'])} 项")
+        if result["unhandled_permissions"]:
+            detail += "; 未自动授予: " + ", ".join(result["unhandled_permissions"])
+        if result["ignored_appops"]:
+            detail += "; 保留 ignore: " + ", ".join(result["ignored_appops"])
+        self._log_action("grant_permissions", detail, start)
+        print(f"   {detail}")
+        return True
 
     def grant_permission(self, package, permission):
         """授予运行时权限"""
@@ -3147,11 +3252,13 @@ class TestCase:
             print(f"[变更归因] {code}：与上次一致或无产品侧变更")
 
     def _case_package_from_script(self):
-        """从用例脚本路径推断被测包名（cases/<包名>/<脚本>.py，目录名像包名才认）。
+        """优先返回准备阶段确定的包名；旧实例回退到 cases/<包名>/ 路径。
 
         判据与 db.backfill_package 一致：纯 ASCII、含点、无空白。
         推断不出（探查脚本无 script_path / 目录名不是包名）返回 None，
         由调用方回退到收尾前台包。"""
+        if getattr(self, "target_package", None):
+            return self.target_package
         sp = (getattr(self, "script_path", None) or "").replace("\\", "/")
         m = re.search(r"/cases/([^/]+)/", sp)
         if not m:

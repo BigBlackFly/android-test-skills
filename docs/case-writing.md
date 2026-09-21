@@ -14,7 +14,7 @@
 
 ```python
 from test_framework import TestCase
-t = TestCase("用例名")
+t = TestCase("用例名", target_package="com.zui.gallery")  # 自动完成四项环境准备
 
 t.step("步骤名")                 # 开启一个步骤
 t.record("PASS|FAIL|WARN|INFO|BLOCKED", "说明")   # 记录结果
@@ -166,23 +166,27 @@ t.require_tap_rid(RID_SAVE, on_absent="BLOCKED")     # 默认仍是 FAIL
 
 跨 App 通用的设备操作（用例前置条件常用）：
 
-| 场景 | 命令/方法 |
-|---|---|
-| **首次使用/重置状态** | `t.pm_clear("包名")` = `adb shell pm clear 包名`（清数据回首次引导） |
-| 强制停止 App | `t.force_stop(pkg)` |
-| 启动 App | `t.launch_app(pkg)`（monkey LAUNCHER 入口，绑本用例 serial） |
-| 读系统属性（判断模式） | `t.getprop("ro.build.type")` / `t.getprop("persist.sys.xxx")` |
-| 读写系统设置 | `t.settings_get("global", key)` / `t.settings_put("secure", key, value)` |
-| 判断设备网络 | `t.has_network()`（解析需要联网时先检查，无网则 BLOCKED） |
-| 授予运行时权限 | `t.grant_permission(pkg, "android.permission.X")` |
-| 前台包/Activity | `t.current_package()` |
-| 锁定竖屏（套件基线） | `t.lock_portrait()`（用例开头调用，结尾不还原，见「定位规范与旋屏约定」节） |
-| 中途转屏的用例 | `t.snapshot_rotation()`（转屏前）→ `finally: t.restore_rotation(snap)` |
+| 场景                             | 命令/方法 |
+|--------------------------------|---|
+| **媒体环境初始化**                   | 每次 `TestCase` 初始化时自动执行 `t.reset_sdcard_files()`：清理用户使用设备过程中产生的文件，并预置测试图片和视频 |
+| **用例要求测试开始前设备中没有图片或视频文件**                   | 初始化后调用 `t.clear_sdcard_files()`，清理用户使用设备过程中产生的文件，不预置测试资源 |
+| **首次使用/重置状态**                  | 初始化自动清数据并授权；后续 `t.pm_clear(pkg)` 清理成功后也会重新授权 |
+| 强制停止 App                       | `t.force_stop(pkg)` |
+| 启动 App                         | `t.launch_app(pkg)`（monkey LAUNCHER 入口，绑本用例 serial） |
+| 读系统属性（判断模式）                    | `t.getprop("ro.build.type")` / `t.getprop("persist.sys.xxx")` |
+| 读写系统设置                         | `t.settings_get("global", key)` / `t.settings_put("secure", key, value)` |
+| 判断设备网络                         | `t.has_network()`（解析需要联网时先检查，无网则 BLOCKED） |
+| 批量授权                          | `t.grant_permissions(pkg)`：失败返回 False、记 WARN，继续执行。见 [环境准备](preparation.md) |
+| 授予运行时权限                        | `t.grant_permission(pkg, "android.permission.X")` |
+| 前台包/Activity                   | `t.current_package()` |
+| 锁定竖屏（套件基线）                     | `t.lock_portrait()`（用例开头调用，结尾不还原，见「定位规范与旋屏约定」节） |
+| 中途转屏的用例                        | `t.snapshot_rotation()`（转屏前）→ `finally: t.restore_rotation(snap)` |
 
 **用例前置处理套路**：
-1. 用例要求"首次使用"状态 → `t.pm_clear(包名)` 再启动
+1. Agent 根据用例内容判断待测 App，查询 `framework/preparation/app_packages.py` 的常量表，并显式传入 `target_package=PKG`。框架依次初始化 sdcard、接收包名、清数据、授权；未提供有效包名时记 INFO 并跳过 App 清理和授权。清数据失败中止，授权失败记 WARN 后继续。见 [环境准备](preparation.md)。
 2. 用例依赖网络/系统模式 → 先 `t.has_network()` / `t.getprop(...)` 判断，不满足标 BLOCKED（环境原因），不硬跑
 3. App 特定前置（如"已导入图片并解析"）→ 写在用例脚本开头按步骤执行
+4. 每次 `TestCase` 初始化时自动执行一次 `t.reset_sdcard_files()`，正式用例、辅助脚本及重跑均执行，脚本无需重复调用。测试用例明确要求“测试开始前，设备中不能有任何图片或视频文件”时，在初始化后调用 `t.clear_sdcard_files()`。文件准备失败记 BLOCKED 并中止；范围与素材见 [文件重置](reset-sdcard-files.md)。
 
 ## 关键技术
 
@@ -273,7 +277,7 @@ t.require_tap_rid(RID_SAVE, on_absent="BLOCKED")     # 默认仍是 FAIL
 | ⛔ BLOCKED | 环境/前置不满足，无法执行 |
 | ℹ️ INFO | 记录性信息 |
 
-**权限测试注意**：拒绝后权限变 USER_FIXED，系统不再弹窗 —— 每个权限行为（允许/拒绝）拆成独立用例、各自 pm_clear，避免级联失败
+**权限测试注意**：各权限行为拆成独立用例；自动准备会清数据并授权，随后按用例要求撤销权限及处理 USER_FIXED 等标志，再启动 App 验证权限行为。
 
 **用例最终结论（final_status）与进程退出码**：框架显式计算最终结论（规则确定：
 FAIL > BLOCKED > WARN > PASS），写入报告头部/汇总、SQLite `cases.final_status` 列

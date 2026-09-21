@@ -37,10 +37,14 @@ Write-Host "  目标: $to"
 Write-Host ""
 
 $files = @()
-# framework 下的代码文件
-Get-ChildItem (Join-Path $from 'framework') -File -ErrorAction SilentlyContinue | ForEach-Object {
-    $files += Join-Path 'framework' $_.Name
-}
+# framework 下的代码文件（包含 preparation 等子包，排除 Python 缓存）
+$frameworkSource = Join-Path $from 'framework'
+Get-ChildItem $frameworkSource -File -Recurse -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -notmatch '[\\/]__pycache__[\\/]' -and $_.Extension -notin @('.pyc', '.pyo') } |
+    ForEach-Object {
+        $relative = [System.IO.Path]::GetRelativePath($frameworkSource, $_.FullName)
+        $files += Join-Path 'framework' $relative
+    }
 # 单元测试
 Get-ChildItem (Join-Path $from 'tests') -File -Filter '*.py' -ErrorAction SilentlyContinue | ForEach-Object {
     $files += Join-Path 'tests' $_.Name

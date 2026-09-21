@@ -15,7 +15,7 @@
 
 ## ① 真机采集（导航骨架 + 业务闭环）
 
-复制 `cases/_lib/_collect_template.py` 当骨架：
+复制 `cases/_lib/_collect_template.py` 当骨架；Agent 根据用例查阅包名常量表，填写 `PKG` 并传入 `target_package`。辅助脚本同样依次初始化 sdcard、接收包名、清数据并授权：
 - 已知导航直接复用 `cases/<包名>/_flow.py` 的 goto_*；全新 App 无 _flow 时用
   `t.d.app_start("包名")` 冷启动 + 首页 `probe_page` 起步（模板已含）
 - 未知下钻"一轮一跳"：`t.probe_page("页面标签")` 落盘 → 看打印摘要定下一跳 → 脚本追加一跳再跑

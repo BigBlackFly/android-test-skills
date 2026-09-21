@@ -20,19 +20,20 @@ cd framework && ../.venv/bin/python run_case.py com.zui.calendar/172.py
 
 ## 能力
 
-| 能力 | 说明 |
-|---|---|
-| 元素操作 | 元素优先定位（resource-id/content-desc/text），坐标仅兜底 |
-| 视觉定位 | tap_vision：SoM 网格 + 归一化坐标双策略，定位 view tree/OCR 无法找到的元素 |
-| 弹窗看门狗 | 主流程驱动检测权限/引导弹窗立即点击（词表快路径 + 视觉模型兜底未知弹窗；allow/deny 策略可切换） |
-| 权限测试 | 相机/图库允许+拒绝路径（拆分隔离避免 USER_FIXED 级联） |
-| 断言 | 文本/开关/长度上限/置灰（像素对比度） |
-| Canvas 读取 | RapidOCR 读自绘控件（滚轮/画布文字） |
-| 滚轮操作 | 点按切换（零惯性，比滑动准） |
+| 能力 | 说明                                                                                                                   |
+|---|----------------------------------------------------------------------------------------------------------------------|
+| 元素操作 | 元素优先定位（resource-id/content-desc/text），坐标仅兜底                                                                          |
+| 视觉定位 | tap_vision：SoM 网格 + 归一化坐标双策略，定位 view tree/OCR 无法找到的元素                                                                |
+| 弹窗看门狗 | 主流程驱动检测权限/引导弹窗立即点击（词表快路径 + 视觉模型兜底未知弹窗；allow/deny 策略可切换）                                                              |
+| 权限测试 | 相机/图库允许+拒绝路径（拆分隔离避免 USER_FIXED 级联）                                                                                   |
+| 断言 | 文本/开关/长度上限/置灰（像素对比度）                                                                                                 |
+| Canvas 读取 | RapidOCR 读自绘控件（滚轮/画布文字）                                                                                              |
+| 滚轮操作 | 点按切换（零惯性，比滑动准）                                                                                                       |
+| 测试环境准备 | Agent 根据用例判断应用并查表取得包名；框架依次初始化 sdcard 文件→ 清空 App 数据 → 授予 App 权限。未提供有效包名时跳过 App 数据清理和授权。见 [环境准备](docs/preparation.md)  |
 | UIUX 知识 | 从 [知识库索引](uiux-knowledge/README.md) 按包名查找 App，先读相关页面 Markdown，再读取测试经验知识卡；布局细节按需补读配图，见 [使用说明](docs/uiux-knowledge.md) |
-| 知识卡 | 按前台包名检索 App 操作经验（检索索引/标准链路/页面控件/已知坑） |
-| 结果分类 | PASS / FAIL / WARN / BLOCKED / INFO / ERROR（异常路径也有报告） |
-| 报告 | 自动生成 Markdown，含每步结果+截图证据 |
+| 知识卡 | 按前台包名检索 App 操作经验（检索索引/标准链路/页面控件/已知坑）                                                                                 |
+| 结果分类 | PASS / FAIL / WARN / BLOCKED / INFO / ERROR（异常路径也有报告）                                                                |
+| 报告 | 自动生成 Markdown，含每步结果+截图证据                                                                                             |
 
 ## 目录结构
 
@@ -48,6 +49,10 @@ android-test-skills/
 ├── framework/
 │   ├── test_framework.py   # 测试框架（元素/OCR/视觉/看门狗/报告）
 │   ├── run_case.py         # 用例执行器（退出码反映最终结论）
+│   ├── preparation/        # 测试环境准备
+│   │   ├── reset_sdcard_files.py    # 用户文件清理与测试图片、视频预置
+│   │   ├── grant_app_permissions.py # 目标 App 批量授权
+│   │   └── app_packages.py          # 应用名称与包名常量表，供 Agent 查询
 │   ├── states.py           # 状态检测（场景卡自动注册）
 │   ├── db.py               # SQLite 测试记录
 │   ├── screenshot.py       # 公共截图管线（采集/裁剪/压缩/几何显式化）
@@ -58,8 +63,10 @@ android-test-skills/
 │   └── webui.py/.html/.js/.css  # Web 测试台
 ├── docs/              # SKILL.md 拆出的子文档（按需读，不常驻 Agent 上下文）
 │   ├── case-writing.md    # 写用例指南（API 速查/定位规范/关键技术/结果分类）
+│   ├── preparation.md     # 文件准备、App 数据清理与批量授权
 │   ├── explore-guide.md   # 探索 SOP（新页面四步探查）
 │   └── OPS.md             # 运维排障（Web UI/SQLite/Windows）
+├── media-resources/   # 少量图片/短视频，随 skill 分发，reset 时推送设备
 ├── uiux-knowledge/   # UIUX Markdown 索引与页面知识（apps/<包名>/，含局部图和来源）
 ├── knowledge/        # App 知识卡（Markdown，按包名）+ scenarios/ 场景卡
 ├── cases/            # 用例（按被测 App 包名分目录，如 cases/com.zui.calendar/172.py）
@@ -69,7 +76,7 @@ android-test-skills/
 ## 架构：skill 包 vs 工作区
 
 - **skill 包**（`~/.agents/skills/android-test-skills`，Agent 管理，只读）：
-  framework/、docs/、tests/、evals/、scripts/、SKILL.md
+  framework/、docs/、tests/、evals/、scripts/、media-resources/、SKILL.md
 - **工作区**（`~/android-test-skills-data`，用户数据，读写）：
   `.venv/`、`cases/`（副本）、`knowledge/`（副本）、`storage/`、`test_records.db`
 
@@ -82,7 +89,7 @@ android-test-skills/
 from test_framework import TestCase
 
 def run():
-    t = TestCase("我的用例")
+    t = TestCase("我的用例", target_package="com.zui.gallery")
     t.step("步骤1")
     t.tap_rid("com.example.app:id/btn_start")   # rid 优先（App 自有控件禁止 text 定位）
     t.record("PASS", "点击成功")

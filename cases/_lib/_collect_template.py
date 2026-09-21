@@ -23,12 +23,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(_HERE)), "framew
 
 from test_framework import TestCase          # noqa: E402
 
-# 被测 App 包名（改这里；本模板是通用骨架，勿提交硬编码包名的副本）
+# Agent 根据用例查阅 app_packages.py 后填写包名；无法确定时设为 None
 PKG = "com.example.app"
 
 # ========== 全新 App 无 _flow 的起步方式（二选一，有 _flow 直接跳过） ==========
 # from test_framework import TestCase
-# t = TestCase("探索_<App名>")                 # 自动绑设备/唤醒
+# t = TestCase("探索_<App名>", target_package=PKG) # 自动完成四项环境准备
 # t.d.app_start(PKG)                            # 冷启动目标 App
 # t.set_trace()                                 # 开采集会话档案
 # info = t.probe_page("首页", ocr=False)        # 首页落盘 → 看摘要定下一跳
@@ -36,7 +36,7 @@ PKG = "com.example.app"
 
 
 def collect():
-    t = TestCase("采集_新页面")
+    t = TestCase("采集_新页面", target_package=PKG)
     t.start_watchdog(policy="allow")
     t.set_trace()                              # 会话档案：dump 快照 + events 全落盘
 
