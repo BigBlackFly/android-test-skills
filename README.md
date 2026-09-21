@@ -29,6 +29,7 @@ cd framework && ../.venv/bin/python run_case.py com.zui.calendar/172.py
 | 断言 | 文本/开关/长度上限/置灰（像素对比度） |
 | Canvas 读取 | RapidOCR 读自绘控件（滚轮/画布文字） |
 | 滚轮操作 | 点按切换（零惯性，比滑动准） |
+| UIUX 知识 | 从 [知识库索引](uiux-knowledge/README.md) 按包名查找 App，先读相关页面 Markdown，再读取测试经验知识卡；布局细节按需补读配图，见 [使用说明](docs/uiux-knowledge.md) |
 | 知识卡 | 按前台包名检索 App 操作经验（检索索引/标准链路/页面控件/已知坑） |
 | 结果分类 | PASS / FAIL / WARN / BLOCKED / INFO / ERROR（异常路径也有报告） |
 | 报告 | 自动生成 Markdown，含每步结果+截图证据 |
@@ -59,6 +60,7 @@ android-test-skills/
 │   ├── case-writing.md    # 写用例指南（API 速查/定位规范/关键技术/结果分类）
 │   ├── explore-guide.md   # 探索 SOP（新页面四步探查）
 │   └── OPS.md             # 运维排障（Web UI/SQLite/Windows）
+├── uiux-knowledge/   # UIUX Markdown 索引与页面知识（apps/<包名>/，含局部图和来源）
 ├── knowledge/        # App 知识卡（Markdown，按包名）+ scenarios/ 场景卡
 ├── cases/            # 用例（按被测 App 包名分目录，如 cases/com.zui.calendar/172.py）
 └── tests/            # framework 纯逻辑单测（无需设备）

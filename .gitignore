@@ -12,3 +12,12 @@ storage/vision.json
 test_records.db
 .venv/
 _trash_backup/
+
+/.idea
+
+# 本地 Agent 开发文档
+/AGENTS.md
+/devdocs/
+
+# 导入知识库的本机 IDE 配置
+/uiux-knowledge/.idea/
