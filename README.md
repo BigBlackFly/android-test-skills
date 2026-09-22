@@ -76,7 +76,7 @@ android-test-skills/
 ## 架构：skill 包 vs 工作区
 
 - **skill 包**（`~/.agents/skills/android-test-skills`，Agent 管理，只读）：
-  framework/、docs/、tests/、evals/、scripts/、media-resources/、SKILL.md
+  framework/、docs/、tests/、evals/、scripts/、media-resources/、uiux-knowledge/、SKILL.md
 - **工作区**（`~/android-test-skills-data`，用户数据，读写）：
   `.venv/`、`cases/`（副本）、`knowledge/`（副本）、`storage/`、`test_records.db`
 
